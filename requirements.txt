@@ -1,0 +1,21 @@
+# Core stack
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24
+pillow>=10.0
+scikit-learn>=1.3
+tqdm>=4.66
+pyyaml>=6.0
+
+# CLIP zero-shot branch (open_clip from mlfoundations)
+open_clip_torch>=2.24.0
+ftfy>=6.1
+regex>=2023.10.3
+
+# Optional: DINOv3 timm variants (needed only by configs/dinov3_ensemble.yaml)
+# pip install timm>=1.0.10 huggingface_hub
+timm>=1.0.10; extra == "dinov3"
+huggingface_hub>=0.25; extra == "dinov3"
+
+# (optional) nicer progress bars, logging
+wandb>=0.16  ; python_version>="3.9"

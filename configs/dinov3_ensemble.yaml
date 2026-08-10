@@ -1,0 +1,59 @@
+# DINOv2 + DINOv3 ensemble (recommended for A榜最终提交)
+# --------------------------------------------------------
+# Rationale (see SOLUTION.md §2.1):
+#   * DINOv2-L/14  -> stronger IMAGE-LEVEL discrimination (S_cls ↑)
+#   * DINOv3-L/16  -> stronger PIXEL-LEVEL dense features     (S_seg ↑)
+#   * Ensemble both patch maps -> best of both worlds.
+#
+# Setup:
+#   * Primary : DINOv2 ViT-L/14 (blocks 8..11)   448px
+#   * Secondary: DINOv3 ViT-L/16 sat493m (blocks 18..23) 448px
+#     -> 448 / 16 = 28 grid; we bilinearly upsample DINOv3 patch maps to
+#        the same spatial size as DINOv2's 32x32 grid, then fuse features
+#        by CHANNEL-CONCAT before L2-normalisation inside the pipeline.
+#
+# If you don't have DINOv3 / can't install timm, just use default.yaml.
+#
+# To enable this config:
+#   1. pip install timm huggingface_hub
+#   2. python run.py --data CSIG --out submission --config configs/dinov3_ensemble.yaml
+
+# ---- primary backbone (DINOv2) ----
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+
+# ---- secondary DINOv3 branch (patch-level ensemble) ----
+use_dinov3: true
+dinov3_variant: "l16_493"         # vit_large_patch16_dinov3.sat493m via timm
+dinov3_layers: [18, 19, 20, 21, 22, 23]
+dinov3_weight: 0.4                # weight on DINOv3 patch map (DINOv2=0.6)
+
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+
+coreset_ratio: 0.02
+coreset_max: 16384
+neighbourhood_size: 3
+n_neighbours: 5
+smooth_kernel: 9
+smooth_sigma: 4.0
+cls_bank_weight: 0.25
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: true
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 0.75
+ens_clip_weight: 0.25
+
+batch_size: 4
+num_workers: 8
+device: "cuda"
+seed: 42

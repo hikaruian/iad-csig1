@@ -1,0 +1,29 @@
+# Quick / low-memory ablation config
+# DINOv2-B/14 only, no CLIP, smaller coreset. Good for a sanity check on a
+# single 12GB GPU. Expected: ~1-2% below the primary submission.
+dinov2_model: "vitb14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: false
+
+coreset_ratio: 0.01
+coreset_max: 8192
+neighbourhood_size: 3
+n_neighbours: 3
+smooth_kernel: 7
+smooth_sigma: 3.0
+cls_bank_weight: 0.25
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: true
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+batch_size: 8
+num_workers: 8
+device: "cuda"
+seed: 42

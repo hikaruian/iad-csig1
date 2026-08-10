@@ -1,0 +1,47 @@
+# Default configuration for CSIG / Real-IAD Variety challenge
+# ---------------------------------------------------------
+# Reproduces the primary submission described in SOLUTION.md:
+#   * DINOv2 ViT-L/14 multi-layer (8..11) feature extractor
+#   * Per-class coreset PatchCore++
+#   * CLIP ViT-L/14-336 WinCLIP zero-shot branch (ensemble weight 0.25)
+#   * Flip-TTA (4x), cross-view voting, percentile calibration
+#   * Output masks at 448x448, 8-bit grayscale
+#
+# For a faster budget run (single GPU, ~30 min on 50 classes),
+# set dinov2_model="vitb14" and use_clip=false.
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission"
+
+dinov2_model: "vitl14"        # vitb14 | vitl14 | vitg14
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448               # must be divisible by 14
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+
+coreset_ratio: 0.02
+coreset_max: 16384
+neighbourhood_size: 3
+n_neighbours: 5
+smooth_kernel: 9
+smooth_sigma: 4.0
+cls_bank_weight: 0.25
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: true
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 0.75
+ens_clip_weight: 0.25
+
+batch_size: 4
+num_workers: 8
+device: "cuda"
+seed: 42
