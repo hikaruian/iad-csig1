@@ -122,7 +122,7 @@ class PipelineConfig:
     # ---- memory / precision ----
     batch_size: int = 4
     clip_batch_size: int = 2      # separate (smaller) batch size for CLIP forward
-    num_workers: int = 8
+    num_workers: int = 4
     use_amp: bool = True          # use fp16 autocast for backbones (halves activation memory)
     device: str = "cuda"
     seed: int = 42

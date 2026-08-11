@@ -44,7 +44,7 @@ ens_clip_weight: 0.25
 # --- Memory / precision (NEW) ---
 batch_size: 2              # DINO batch size; 2 is safe for 16 GB GPUs
 clip_batch_size: 1         # CLIP batch size (ViT-L@448 uses ~1.3 GB/view in fp16)
-num_workers: 8
+num_workers: 4
 use_amp: true              # fp16 autocast for backbone forwards (~halves VRAM)
 device: "cuda"
 seed: 42
