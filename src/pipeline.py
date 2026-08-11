@@ -121,7 +121,7 @@ class PipelineConfig:
 
     # ---- misc ----
     batch_size: int = 4
-    num_workers: int = 8
+    num_workers: int = 4
     device: str = "cuda"
     seed: int = 42
 

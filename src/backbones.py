@@ -76,7 +76,10 @@ class DINOv2FeatureExtractor(nn.Module):
         for p in self.model.parameters():
             p.requires_grad_(False)
 
-        self.patch_size = self.model.patch_size  # 14
+        ps = self.model.patch_size
+        if isinstance(ps, (tuple, list)):
+            ps = ps[0]
+        self.patch_size = int(ps)
         self.embed_dim = self.model.embed_dim
         self.num_layers = len(list(self.model.blocks))  # e.g. 24 for vitl14
 
@@ -323,15 +326,19 @@ class CLIPFeatureExtractor(nn.Module):
         for p in self.model.parameters():
             p.requires_grad_(False)
 
-        # infer patch size / grid
-        if hasattr(self.model.visual, "patch_size"):
-            self.patch_size = self.model.visual.patch_size
-        else:
-            self.patch_size = 14
+        # infer patch size / grid. Some open_clip checkpoints expose
+        # patch_size as a tuple (pH, pW), others as an int; normalise.
+        ps = getattr(self.model.visual, "patch_size", 14)
+        if isinstance(ps, (tuple, list)):
+            ps = ps[0]
+        self.patch_size = int(ps)
         self.embed_dim = self.model.visual.output_dim  # text/CLS proj dim
         # visual token dim before projection
-        if hasattr(self.model.visual, "transformer"):
+        if hasattr(self.model.visual, "ln_post"):
+            # OpenCLIP ViT: ln_post is the final LayerNorm
             self.visual_dim = self.model.visual.ln_post.normalized_shape[0]
+        elif hasattr(self.model.visual, "output_dim"):
+            self.visual_dim = self.embed_dim
         else:
             self.visual_dim = self.embed_dim
 
@@ -411,3 +418,4 @@ class CLIPFeatureExtractor(nn.Module):
         tok = open_clip.tokenize(prompts).to(device)
         feats = self.model.encode_text(tok)
         return F.normalize(feats, dim=-1)
+
