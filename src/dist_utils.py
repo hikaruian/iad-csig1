@@ -141,8 +141,18 @@ def auto_parallel_forward(module: torch.nn.Module,
             for k, v in kwargs.items()
         }
         fn = m_copy if call == "__call__" else getattr(m_copy, call)
-        with torch.no_grad():
-            out = fn(chunk, **kw_dev)
+        # Use inference_mode for slightly tighter memory (version tracking
+        # disabled) and wrap with autocast when active, so the replicas
+        # also run in fp16 (critical for multi-GPU memory parity).
+        dev_type = dev.type if hasattr(dev, "type") else "cuda"
+        autocast_on = torch.is_autocast_enabled()
+        autocast_dtype = torch.get_autocast_dtype(dev_type) if hasattr(torch, "get_autocast_dtype") else torch.float16
+        with torch.inference_mode():
+            if autocast_on:
+                with torch.autocast(device_type=dev_type, dtype=autocast_dtype, enabled=True):
+                    out = fn(chunk, **kw_dev)
+            else:
+                out = fn(chunk, **kw_dev)
         outputs.append((dev, out))
 
     ref_dev, ref_out = outputs[0]

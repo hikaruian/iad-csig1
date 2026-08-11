@@ -1,5 +1,6 @@
-# Champion config – tuned for 24 GB+ GPUs (RTX 3090/4090/A5000).
-# For 16 GB GPUs, use this but set batch_size=1, clip_batch_size=1.
+# Champion config - tuned for 24 GB+ GPUs (RTX 3090/4090/A5000).
+# For 16 GB GPUs, this should still fit with the new memory optimisations
+# (lazy bank migration + fp16 raw storage + micro-batched DINO).
 #
 # Changes vs default:
 #   * larger coreset (32k)
@@ -7,7 +8,7 @@
 #   * bigger Gaussian smoothing kernel/sigma for cleaner masks
 #   * TTA flip weight 0.6
 #   * CLIP ensemble weight bumped to 0.3 for better image-level ranking
-#   * micro-batch CLIP forward to avoid activation spikes
+#   * banks_on_gpu=true for faster inference (needs ~3.2 GB extra)
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
@@ -27,7 +28,7 @@ cls_bank_weight: 0.25
 
 mv_aggregate: "robust_mean"
 mv_vote_beta: 2.0
-use_mv_attn: true
+use_mv_attn: false
 
 use_tta: true
 tta_weight_orig: 1.0
@@ -36,9 +37,14 @@ tta_weight_flip: 0.6
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
+# --- Memory / precision ---
 batch_size: 2
 clip_batch_size: 1
-num_workers: 8
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
 use_amp: true
+banks_on_gpu: true          # prefetches all banks (~3.2 GB) for speed
+raw_store_fp16: true
 device: "cuda"
 seed: 42

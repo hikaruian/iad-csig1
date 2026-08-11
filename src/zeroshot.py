@@ -110,12 +110,23 @@ def winclip_score(clip_model, patch_feat: torch.Tensor,
 
     # Reference-bank alignment: distance to nearest normal patch, range [0,2]
     # (since cosine sim in [-1,1]); normalise to [0,1] by multiplying by 0.5.
+    # Chunked matmul over bank columns to avoid a (B*N, M) temp when M=2048
+    # (small but saves ~25 MB peak in fp32; matters for 8-GB cards).
     if reference_patches is not None and reference_patches.numel() > 0:
         ref = reference_patches.to(device)
-        sim_ref = flat @ ref.t()            # (B*N, M) cosine
-        d_ref = (1.0 - sim_ref.max(1).values) * 0.5  # (B*N,) in [0,1]
+        if ref.dtype != flat.dtype:
+            ref = ref.to(flat.dtype)
+        max_sim = torch.full((flat.shape[0],), -2.0, device=device, dtype=flat.dtype)
+        bsz = 512
+        for j in range(0, ref.shape[0], bsz):
+            sub = ref[j:j+bsz]
+            s = (flat @ sub.t()).max(1).values
+            torch.maximum(max_sim, s, out=max_sim)
+            del sub, s
+        d_ref = (1.0 - max_sim) * 0.5  # (B*N,) in [0,1]
         map_ref = d_ref.reshape(B, Hp, Wp)
         amap = alpha * map_text + (1 - alpha) * map_ref
+        del max_sim, d_ref, map_ref
     else:
         amap = map_text
 
@@ -131,10 +142,13 @@ def build_winclip_reference(clip_model, patch_feat_all: torch.Tensor,
     Build a small normal-reference patch bank for one class via random
     selection (deterministic seed). Used by the WinCLIP branch.
 
-    patch_feat_all: (N_total_patches, D) L2-normalised.
+    Memory note: we store the reference bank in FP16 to halve CPU/GPU
+    storage. Cosine-similarity tolerates fp16 rounding easily (~1e-3 rel
+    error), and the chunked matmul in winclip_score upcasts implicitly.
     """
     n = patch_feat_all.shape[0]
     n_select = min(n_select, n)
     g = torch.Generator().manual_seed(0)
     idx = torch.randperm(n, generator=g)[:n_select]
-    return _normalize(patch_feat_all[idx], dim=-1).contiguous()
+    bank = _normalize(patch_feat_all[idx], dim=-1).contiguous()
+    return bank.half() if bank.dtype != torch.float16 else bank

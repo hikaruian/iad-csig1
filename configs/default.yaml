@@ -2,9 +2,19 @@
 # -------------------------------------------------------------
 # Reproduces the primary submission.
 # Tuned for a SINGLE 16 GB GPU (RTX 3090/4080/A100-16G).
-# If you have ≥24 GB, use configs/champion.yaml instead.
+# If you have >=24 GB, use configs/champion.yaml instead.
+# If you have <=12 GB, use configs/lowmem.yaml.
 #
-# Expected runtime: ~90 min on 1× RTX 3090 at 448px with 50 classes.
+# Memory budget breakdown (fp16 AMP, lazy banks):
+#   DINOv2-L weights       ~600 MB
+#   CLIP ViT-L/14 weights  ~800 MB
+#   Activations (micro=2)  ~1.5 GB peak
+#   Single-class coreset   ~64 MB
+#   Buffers / TTA / maps   ~200 MB
+#   ----------------------------
+#   TOTAL                  ~3.2 GB per GPU
+#
+# Expected runtime: ~90 min on 1x RTX 3090 at 448px with 50 classes.
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
@@ -30,7 +40,7 @@ cls_bank_weight: 0.25
 # --- Multi-view ---
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
-use_mv_attn: true
+use_mv_attn: false          # unused in default scoring; saves ~16 MB
 
 # --- TTA ---
 use_tta: true
@@ -41,10 +51,14 @@ tta_weight_flip: 0.5
 ens_dino_weight: 0.75
 ens_clip_weight: 0.25
 
-# --- Memory / precision (NEW) ---
-batch_size: 2              # DINO batch size; 2 is safe for 16 GB GPUs
-clip_batch_size: 1         # CLIP batch size (ViT-L@448 uses ~1.3 GB/view in fp16)
-num_workers: 4
-use_amp: true              # fp16 autocast for backbone forwards (~halves VRAM)
+# --- Memory / precision ---
+batch_size: 2               # DINO train-time batch size
+clip_batch_size: 1          # CLIP forward micro-batch (ViT-L@448 ~1.3 GB/view in fp16)
+dino_view_micro: 2          # max views per DINO micro-batch at inference
+knn_chunk: 512              # query chunk for kNN matmul (lowers peak VRAM)
+num_workers: 4              # DataLoader workers; 4 is safe for 16 GB CPU RAM
+use_amp: true               # fp16 autocast for backbones (~halves VRAM)
+banks_on_gpu: false         # lazy per-class bank migration (~64 MB vs ~3.2 GB)
+raw_store_fp16: true        # store raw train features in fp16 (halves CPU RAM)
 device: "cuda"
 seed: 42

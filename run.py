@@ -68,6 +68,10 @@ def main():
                     help="Disable fp16 autocast (slower, uses more VRAM, more precise)")
     ap.add_argument("--batch-size", type=int, default=None,
                     help="Override DINO batch size (lower this if you still OOM)")
+    ap.add_argument("--banks-on-gpu", action="store_true", default=None,
+                    help="Prefetch all coreset banks to GPU (faster, uses ~3.2 GB more VRAM)")
+    ap.add_argument("--dino-micro", type=int, default=None,
+                    help="Override DINO inference micro-batch size (views per forward)")
     args = ap.parse_args()
 
     cfg = PipelineConfig()
@@ -94,6 +98,10 @@ def main():
         cfg.use_amp = False
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.banks_on_gpu:
+        cfg.banks_on_gpu = True
+    if args.dino_micro is not None:
+        cfg.dino_view_micro = args.dino_micro
 
     out_dir = Path(cfg.out_dir)
     if out_dir.exists():

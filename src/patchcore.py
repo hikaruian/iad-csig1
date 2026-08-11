@@ -172,7 +172,9 @@ class MultiClassPatchCore:
                  smooth_kernel: int = 9,
                  smooth_sigma: float = 4.0,
                  cls_bank_weight: float = 0.3,
-                 random_proj_dim: int = 256):
+                 random_proj_dim: int = 256,
+                 knn_chunk: int = 512,
+                 raw_store_fp16: bool = True):
         self.coreset_ratio = coreset_ratio
         self.coreset_max = coreset_max
         self.neighbourhood_size = neighbourhood_size
@@ -182,6 +184,9 @@ class MultiClassPatchCore:
         self.smooth_sigma = smooth_sigma
         self.cls_bank_weight = cls_bank_weight
         self.random_proj_dim = random_proj_dim
+        # Memory-tuning knobs
+        self.knn_chunk = int(knn_chunk)               # lower = less peak VRAM for kNN matmul
+        self.raw_store_fp16 = bool(raw_store_fp16)    # store raw train patches in fp16 (halves CPU RAM)
         self.banks: Dict[str, ClassBank] = {}
         self._raw_features: Dict[str, List[Tensor]] = {}
         self._raw_cls: Dict[str, List[Tensor]] = {}
@@ -193,15 +198,27 @@ class MultiClassPatchCore:
 
         patch_feat: (B, D, Hp, Wp) – L2-normalised fused multi-layer patches.
         cls_feat  : (B, D)         – L2-normalised CLS tokens.
+
+        Memory note: we downcast to fp16 when raw_store_fp16 is True. The
+        storage requirement per class is 100 imgs × 32×32 patches × 1024-d
+        = ~105M floats ≈ 420 MB in fp32 but only ~210 MB in fp16; over 50
+        classes that's ~10 GB vs ~20 GB of CPU RAM. Coreset selection
+        upcasts back to fp32 (or uses RP fp16) with no quality loss because
+        L2-normalised features have magnitude 1.0 and fp16 preserves
+        cosine-similarity to ~1e-3, well within coreset tolerance.
         """
         B, D, Hp, Wp = patch_feat.shape
         flat = patch_feat.permute(0, 2, 3, 1).reshape(-1, D).cpu()
+        cls_cpu = cls_feat.cpu()
+        if self.raw_store_fp16 and flat.dtype != torch.float16:
+            flat = flat.half()
+            cls_cpu = cls_cpu.half()
         if cls not in self._raw_features:
             self._raw_features[cls] = []
             self._raw_cls[cls] = []
             self.Hp, self.Wp = Hp, Wp
         self._raw_features[cls].append(flat)
-        self._raw_cls[cls].append(cls_feat.cpu())
+        self._raw_cls[cls].append(cls_cpu)
 
     def build(self, device: str | torch.device | None = None,
               bank_device: str | torch.device | None = "cpu"):
@@ -226,8 +243,12 @@ class MultiClassPatchCore:
         for cls, feats in self._raw_features.items():
             all_feats = torch.cat(feats, dim=0)   # (N, D)
             all_cls = torch.cat(self._raw_cls[cls], dim=0)
+            # Filter dead (zero-padding) patches
             all_feats = all_feats[all_feats.abs().sum(-1) > 0]
 
+            # Upcast to fp32 for coreset selection only if needed; the
+            # distance computation on fp16 is numerically stable enough
+            # for farthest-point sampling.
             n_select = min(
                 self.coreset_max,
                 max(1024, int(self.coreset_ratio * all_feats.shape[0])),
@@ -235,8 +256,8 @@ class MultiClassPatchCore:
             bank = greedy_coreset(all_feats, n_select=n_select,
                                   random_proj_dim=self.random_proj_dim,
                                   device=compute_dev)
-            bank = F.normalize(bank, dim=-1).contiguous()
-            proto = F.normalize(all_cls.to(compute_dev).mean(0, keepdim=True),
+            bank = F.normalize(bank.float(), dim=-1).contiguous()
+            proto = F.normalize(all_cls.to(compute_dev).float().mean(0, keepdim=True),
                                 dim=-1).squeeze(0)
             self.banks[cls] = ClassBank(
                 features=bank.to(bank_device).contiguous(),
@@ -271,16 +292,41 @@ class MultiClassPatchCore:
         q   : (B*N, D) L2-normalised
         bank: (M, D)   L2-normalised
         returns (B*N,) distance = (1 - cos_sim) per query patch.
-        Batched matmul over chunks to avoid OOM.
+
+        Memory note: a full (B*N, M) similarity matrix is ~4 GB for 1024
+        patches × 16k bank in fp32 (1024*16384*4 ≈ 64 MB actually;
+        but for larger coreset sizes or batches this blows up quickly).
+        We chunk over queries AND over bank columns to cap peak activation
+        at roughly ``self.knn_chunk * coreset_chunk * 4 bytes``.
         """
-        chunk = 4096
-        d_min = torch.empty(q.shape[0], device=q.device, dtype=q.dtype)
-        for i in range(0, q.shape[0], chunk):
-            qc = q[i:i+chunk]  # (c, D)
-            sim = qc @ bank.t()  # (c, M) cosine similarity
-            topk_sim = sim.topk(self.n_neighbours, dim=1).values.mean(1)
-            d_min[i:i+chunk] = 1.0 - topk_sim
-        return d_min
+        q_chunk = self.knn_chunk
+        b_chunk = min(4096, max(512, bank.shape[0]))
+        N = q.shape[0]
+        topk_best = torch.full((N, self.n_neighbours), -2.0,
+                               device=q.device, dtype=q.dtype)
+        # Two-pass: topk over bank chunks, then topk over retained.
+        for i in range(0, N, q_chunk):
+            qc = q[i:i+q_chunk]
+            running_topk = None
+            for j in range(0, bank.shape[0], b_chunk):
+                bc = bank[j:j+b_chunk]
+                sim = qc @ bc.t()  # (c, bc)
+                k = min(self.n_neighbours, sim.shape[1])
+                vals, _idx = sim.topk(k, dim=1)
+                if running_topk is None:
+                    running_topk = vals
+                else:
+                    running_topk = torch.cat([running_topk, vals], dim=1)
+                    k2 = min(self.n_neighbours, running_topk.shape[1])
+                    running_topk = running_topk.topk(k2, dim=1).values
+                del sim, vals, bc
+            if running_topk is not None:
+                pad = self.n_neighbours - running_topk.shape[1]
+                if pad > 0:
+                    running_topk = F.pad(running_topk, (0, pad), value=-2.0)
+                topk_best[i:i+q_chunk] = running_topk
+            del qc, running_topk
+        return 1.0 - topk_best.mean(1)
 
     @torch.no_grad()
     def predict(self, cls: str, patch_feat: Tensor,

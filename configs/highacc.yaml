@@ -1,7 +1,7 @@
 # Highest-accuracy config (slower, needs ~24GB GPU at 448px; if you hit OOM
-# at 518px, either drop input_size back to 448 or set batch_size=1 / clip_batch_size=1).
+# at 518px, either drop input_size back to 448 or set batch_size=1 / dino_view_micro=1).
 # Uses DINOv2-g/14 with deeper layers and a bigger memory bank, plus stronger
-# CLIP ensemble.
+# CLIP ensemble. ViT-g/14 is ~1.2B params so fp16 weights alone are ~2.4 GB.
 
 dinov2_model: "vitg14"
 dinov2_layers: [16, 20, 22, 23, 24, 27, 31, 35, 39]   # last 9 blocks of ViT-g/40
@@ -21,7 +21,7 @@ cls_bank_weight: 0.3
 
 mv_aggregate: "robust_mean"
 mv_vote_beta: 2.0
-use_mv_attn: true
+use_mv_attn: false
 
 use_tta: true
 tta_weight_orig: 1.0
@@ -30,9 +30,14 @@ tta_weight_flip: 0.6
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
+# --- Memory / precision ---
 batch_size: 1
 clip_batch_size: 1
-num_workers: 8
+dino_view_micro: 1       # one view at a time for ViT-g/14
+knn_chunk: 256
+num_workers: 4
 use_amp: true
+banks_on_gpu: true       # ViT-g only fits comfortably on 24GB so we can prefetch
+raw_store_fp16: true
 device: "cuda"
 seed: 42
