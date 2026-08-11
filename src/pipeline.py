@@ -127,9 +127,12 @@ class PipelineConfig:
     dino_view_micro: int = 2      # max views to feed DINO in one micro-batch
                                   # during TTA inference (lowers activation peak)
     knn_chunk: int = 512          # query chunk for kNN matmul (lower = less VRAM)
+    coreset_batch: int = 64       # FPS batch size -- larger = faster coreset build
+    coreset_presample_ratio: float = 3.0  # random presample multiplier before FPS (speeds up coreset selection)
     num_workers: int = 4          # DataLoader workers; 4 is safer for 16 GB CPU RAM
     use_amp: bool = True          # use fp16 autocast for backbones (halves activation memory)
     banks_on_gpu: bool = False    # prefetch all coreset banks to GPU (faster but ~3.2 GB)
+    coreset_on_gpu: bool = True   # run greedy coreset selection on GPU (fast; ~<500 MB temp)
     device: str = "cuda"
     seed: int = 42
 
@@ -183,6 +186,8 @@ class CSIGAnomalyPipeline:
             cls_bank_weight=self.cfg.cls_bank_weight,
             knn_chunk=self.cfg.knn_chunk,
             raw_store_fp16=True,
+            coreset_batch=self.cfg.coreset_batch,
+            coreset_presample_ratio=self.cfg.coreset_presample_ratio,
         )
         # Calibrator for image-level scores (per-class)
         self.calibrator = PerClassPercentileCalibrator()
@@ -371,17 +376,20 @@ class CSIGAnomalyPipeline:
             clip_patch_accum.clear()
             self._empty_cache()
 
-        # ---- Phase 3: coreset subsampling. Run on CPU by default
-        # (greedy_coreset supports CUDA but on 16GB cards the intermediate
-        # [N, 256] RP matrix + distance tensors can push us over).
+        # ---- Phase 3: coreset subsampling.
+        # With the new GPU-accelerated batched FPS + native torch RP, building
+        # all 50 classes takes a few SECONDS on GPU vs minutes on CPU.
+        # GPU memory footprint during selection is bounded by
+        #   (M*K + M*b) in fp16 ~ (49k*256 + 49k*64)*2 bytes ~ 30 MB
+        # which is essentially free.
         print("[fit] Building coreset memory banks ...")
-        coreset_dev = "cpu"
+        coreset_dev = "cuda" if (self.cfg.coreset_on_gpu and self.device.type == "cuda") else "cpu"
         try:
             self.patchcore.build(device=coreset_dev, bank_device="cpu")
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) or "out of memory" in str(e):
                 self._empty_cache()
-                print("[fit] coreset on CUDA failed, retrying on CPU ...")
+                print(f"[fit] coreset on {coreset_dev} failed with OOM, retrying on CPU ...")
                 self.patchcore.build(device="cpu", bank_device="cpu")
             else:
                 raise

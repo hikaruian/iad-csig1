@@ -70,6 +70,8 @@ def main():
                     help="Override DINO batch size (lower this if you still OOM)")
     ap.add_argument("--banks-on-gpu", action="store_true", default=None,
                     help="Prefetch all coreset banks to GPU (faster, uses ~3.2 GB more VRAM)")
+    ap.add_argument("--coreset-on-cpu", action="store_true",
+                    help="Run coreset selection on CPU (slower, uses ~0.5 GB less GPU temp)")
     ap.add_argument("--dino-micro", type=int, default=None,
                     help="Override DINO inference micro-batch size (views per forward)")
     args = ap.parse_args()
@@ -100,6 +102,8 @@ def main():
         cfg.batch_size = args.batch_size
     if args.banks_on_gpu:
         cfg.banks_on_gpu = True
+    if args.coreset_on_cpu:
+        cfg.coreset_on_gpu = False
     if args.dino_micro is not None:
         cfg.dino_view_micro = args.dino_micro
 

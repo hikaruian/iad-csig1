@@ -1,6 +1,5 @@
 # Champion config - tuned for 24 GB+ GPUs (RTX 3090/4090/A5000).
-# For 16 GB GPUs, this should still fit with the new memory optimisations
-# (lazy bank migration + fp16 raw storage + micro-batched DINO).
+# For 16 GB GPUs, this should still fit with the new memory optimisations.
 #
 # Changes vs default:
 #   * larger coreset (32k)
@@ -25,6 +24,9 @@ n_neighbours: 9
 smooth_kernel: 11
 smooth_sigma: 4.5
 cls_bank_weight: 0.25
+coreset_batch: 128         # larger batch = even faster coreset build on fast GPUs
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
 
 mv_aggregate: "robust_mean"
 mv_vote_beta: 2.0
@@ -37,14 +39,14 @@ tta_weight_flip: 0.6
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
-# --- Memory / precision ---
 batch_size: 2
 clip_batch_size: 1
 dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: true          # prefetches all banks (~3.2 GB) for speed
+banks_on_gpu: true
+coreset_on_gpu: true
 raw_store_fp16: true
 device: "cuda"
 seed: 42

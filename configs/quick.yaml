@@ -15,6 +15,9 @@ n_neighbours: 3
 smooth_kernel: 7
 smooth_sigma: 3.0
 cls_bank_weight: 0.25
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
 
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
@@ -35,6 +38,7 @@ knn_chunk: 1024
 num_workers: 4
 use_amp: true
 banks_on_gpu: false
+coreset_on_gpu: true
 raw_store_fp16: true
 device: "cuda"
 seed: 42

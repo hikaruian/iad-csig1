@@ -4,10 +4,6 @@
 # Expected peak GPU memory: ~2.2-2.5 GB with CLIP, ~1.4 GB without.
 # Runtime is ~15-20% slower than default due to smaller micro-batches.
 
-train_root: "CSIG/Train"
-test_root:  "CSIG/Test_A"
-out_dir:    "submission"
-
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
 input_size: 392             # 392/14=28 (smaller grid -> lower activation memory)
@@ -16,13 +12,16 @@ use_clip: true
 clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
 
-coreset_ratio: 0.01         # smaller coreset banks
+coreset_ratio: 0.01
 coreset_max: 8192
 neighbourhood_size: 3
 n_neighbours: 5
 smooth_kernel: 9
 smooth_sigma: 4.0
 cls_bank_weight: 0.25
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
 
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
@@ -35,14 +34,14 @@ tta_weight_flip: 0.5
 ens_dino_weight: 0.75
 ens_clip_weight: 0.25
 
-# --- Memory / precision (AGRESSIVE) ---
 batch_size: 1
 clip_batch_size: 1
 dino_view_micro: 1          # one view at a time -> minimum activation peak
 knn_chunk: 256
 num_workers: 2
 use_amp: true
-banks_on_gpu: false         # lazy migration, evict each class after use
+banks_on_gpu: false
+coreset_on_gpu: true
 raw_store_fp16: true
 device: "cuda"
 seed: 42
