@@ -73,7 +73,7 @@ class PipelineConfig:
 
     # ---- misc ----
     batch_size: int = 1                     # per-view batch (i.e. 4 samples)
-    num_workers: int = 2
+    num_workers: int = 1
     device: str = "cuda"
     seed: int = 42
 
