@@ -1,38 +1,22 @@
-# =============================================================================
-# Champion config (A榜冲榜推荐)
-# =============================================================================
-# 本配置可直接通过 `python run.py --data CSIG --out sub_champ --config configs/champion.yaml` 运行，
-# 所有字段均已在 PipelineConfig 中实现并经过基本 bug 修复。
+# Champion config – tuned for 24 GB+ GPUs (RTX 3090/4090/A5000).
+# For 16 GB GPUs, use this but set batch_size=1, clip_batch_size=1.
 #
-# 相对 default.yaml 的变化：
-#   * 更大的 coreset (32k)，更多 nearest neighbours (9)，更大平滑核
-#   * TTA 翻转权重更均衡 (0.6)，mask voting beta 提高到 2.0
-#   * batch_size=2 以适配 24GB 显卡 + 更大负载
-#   * CLIP 分支权重 0.3（比默认略高，利用语义互补）
-#
-# 以下高级模块已以独立类/函数形式实现于 src/ 目录中，但**未接入默认 pipeline 路径**
-# （因为完整集成需要更复杂的fit/predict流程与额外训练时间），有经验的用户可自行接入：
-#   - src/dinomaly_lite.py     : LooseDecoder 重建分支 (需额外训练 ~10 min)
-#   - src/foreground.py        : DINOv2 CLS-patch 前景掩码
-#   - src/fusion.py            : DMA 双模态特征级融合
-#   - src/hr_sliding.py        : 高分辨率滑窗推理 (适合 >896px 的原图)
-#   - src/anoco.py             : ANoCo 拉普拉斯非共形评分器
-#   - src/postprocess.py       : ZCA 白化 / 自适应归一化
-#   - src/competition_tricks.py: GMM 后处理 / 连通域降噪 / 多尺度 TTA
-#   - src/secret_sauce.py      : hard-negative mining / transductive whitening / gamma 0.6
-# 以上模块接入后预期再 +2~4pp，但需要修改 pipeline.py 的 fit/_predict_one_sample 流程。
-# =============================================================================
+# Changes vs default:
+#   * larger coreset (32k)
+#   * more nearest neighbours (9)
+#   * bigger Gaussian smoothing kernel/sigma for cleaner masks
+#   * TTA flip weight 0.6
+#   * CLIP ensemble weight bumped to 0.3 for better image-level ranking
+#   * micro-batch CLIP forward to avoid activation spikes
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
-
 input_size: 448
 
 use_clip: true
 clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
 
-# --- PatchCore hyperparams (tuned for 50-class multi-industry) ---
 coreset_ratio: 0.03
 coreset_max: 32768
 neighbourhood_size: 3
@@ -41,21 +25,20 @@ smooth_kernel: 11
 smooth_sigma: 4.5
 cls_bank_weight: 0.25
 
-# --- Multi-view ---
 mv_aggregate: "robust_mean"
 mv_vote_beta: 2.0
 use_mv_attn: true
 
-# --- TTA ---
 use_tta: true
 tta_weight_orig: 1.0
 tta_weight_flip: 0.6
 
-# --- Ensemble weights ---
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
 batch_size: 2
+clip_batch_size: 1
 num_workers: 8
+use_amp: true
 device: "cuda"
 seed: 42

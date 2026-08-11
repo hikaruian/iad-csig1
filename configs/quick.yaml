@@ -1,6 +1,7 @@
-# Quick / low-memory ablation config
-# DINOv2-B/14 only, no CLIP, smaller coreset. Good for a sanity check on a
-# single 12GB GPU. Expected: ~1-2% below the primary submission.
+# Quick / low-memory ablation config.
+# DINOv2-B/14 only, no CLIP, smaller coreset. Good for a sanity run on an
+# 8 GB GPU or for fast iteration (≈20 min). Expected ≈1-2% below champion.
+
 dinov2_model: "vitb14"
 dinov2_layers: [8, 9, 10, 11]
 input_size: 448
@@ -23,7 +24,12 @@ use_tta: true
 tta_weight_orig: 1.0
 tta_weight_flip: 0.5
 
-batch_size: 8
+ens_dino_weight: 1.0
+ens_clip_weight: 0.0
+
+batch_size: 4
+clip_batch_size: 2
 num_workers: 8
+use_amp: true
 device: "cuda"
 seed: 42

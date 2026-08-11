@@ -20,6 +20,7 @@ import argparse
 import shutil
 import sys
 import zipfile
+from dataclasses import fields
 from pathlib import Path
 
 import yaml
@@ -63,6 +64,10 @@ def main():
                     help="Disable CLIP/WinCLIP ensemble branch")
     ap.add_argument("--dp", action="store_true",
                     help="Enable DataParallel across all visible GPUs (single-node, simple)")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="Disable fp16 autocast (slower, uses more VRAM, more precise)")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="Override DINO batch size (lower this if you still OOM)")
     args = ap.parse_args()
 
     cfg = PipelineConfig()
@@ -71,7 +76,12 @@ def main():
     cfg.out_dir = args.out
 
     if args.config is not None:
-        cfg = merge_into_cfg(cfg, load_yaml_cfg(args.config))
+        overrides = load_yaml_cfg(args.config)
+        known = {f.name for f in fields(PipelineConfig)}
+        unknown = set(overrides) - known
+        if unknown:
+            print(f"[warn] Ignoring unknown config keys: {sorted(unknown)}")
+        cfg = merge_into_cfg(cfg, overrides)
     if args.device:
         cfg.device = args.device
     if args.dinov2:
@@ -80,6 +90,10 @@ def main():
         cfg.use_clip = False
     if args.dp:
         cfg.use_dp = True
+    if args.no_amp:
+        cfg.use_amp = False
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
 
     out_dir = Path(cfg.out_dir)
     if out_dir.exists():

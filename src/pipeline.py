@@ -119,9 +119,11 @@ class PipelineConfig:
     dino_img_lo_q: float = 0.05
     dino_img_hi_q: float = 0.95
 
-    # ---- misc ----
+    # ---- memory / precision ----
     batch_size: int = 4
-    num_workers: int = 4
+    clip_batch_size: int = 2      # separate (smaller) batch size for CLIP forward
+    num_workers: int = 8
+    use_amp: bool = True          # use fp16 autocast for backbones (halves activation memory)
     device: str = "cuda"
     seed: int = 42
 
@@ -137,12 +139,20 @@ class CSIGAnomalyPipeline:
         torch.manual_seed(self.cfg.seed)
         np.random.seed(self.cfg.seed)
 
+        self.use_amp = bool(self.cfg.use_amp and self.device.type == "cuda")
+        self.amp_dtype = torch.float16  # safe for DINOv2 + CLIP ViT
+
+        print(f"[pipeline] device={self.device}, use_amp={self.use_amp}, use_dp={self.cfg.use_dp}")
+
         print(f"[pipeline] Loading DINOv2 {self.cfg.dinov2_model} ...")
         self.dino = DINOv2FeatureExtractor(
             model_name=self.cfg.dinov2_model,
             layers=self.cfg.dinov2_layers,
             pretrained=True,
-        ).to(self.device).eval()
+        )
+        if self.use_amp:
+            self.dino = self.dino.half()
+        self.dino = self.dino.to(self.device).eval()
 
         self.clip = None
         if self.cfg.use_clip:
@@ -150,7 +160,10 @@ class CSIGAnomalyPipeline:
             self.clip = CLIPFeatureExtractor(
                 model_name=self.cfg.clip_model,
                 pretrained=self.cfg.clip_pretrained,
-            ).to(self.device).eval()
+            )
+            if self.use_amp:
+                self.clip = self.clip.half()
+            self.clip = self.clip.to(self.device).eval()
 
         self.classes: List[str] = []
         self.patchcore = MultiClassPatchCore(
@@ -177,17 +190,34 @@ class CSIGAnomalyPipeline:
         # but kept as an attribute in case a custom pipeline wants it.
         self.mv_attn = None
         if self.cfg.use_mv_attn:
-            self.mv_attn = CrossViewAttention(unwrap(self.dino).embed_dim).to(self.device).eval()
+            mv_dim = unwrap(self.dino).embed_dim
+            self.mv_attn = CrossViewAttention(mv_dim).to(self.device).eval()
+            if self.use_amp:
+                self.mv_attn = self.mv_attn.half()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _autocast_ctx(self):
+        """Return a context manager: fp16 autocast when AMP enabled."""
+        if self.use_amp:
+            return torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=True)
+        from contextlib import nullcontext
+        return nullcontext()
+
     def _run_backbone(self, module, x, call: str = "__call__", **kwargs):
         if self.cfg.use_dp and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             from .dist_utils import auto_parallel_forward
-            return auto_parallel_forward(module, x, call=call, **kwargs)
+            with self._autocast_ctx():
+                return auto_parallel_forward(module, x, call=call, **kwargs)
         fn = module if call == "__call__" else getattr(module, call)
-        return fn(x, **kwargs)
+        with self._autocast_ctx():
+            return fn(x, **kwargs)
+
+    @staticmethod
+    def _empty_cache():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _dino_forward(self, x: torch.Tensor, cls: str,
                       return_map: bool = True) -> Dict[str, torch.Tensor]:
@@ -196,7 +226,11 @@ class CSIGAnomalyPipeline:
         calibration and inference so the two paths are NUMERICALLY IDENTICAL
         (modulo TTA at inference time)."""
         out = self._run_backbone(self.dino, x)
-        res = self.patchcore.predict(cls, out["patch"], out["cls"], return_map=return_map)
+        # Backbone may return fp16 when AMP is enabled; upcast for kNN
+        # math and downstream stats to keep distances precise.
+        patch = out["patch"].float()
+        cls_tok = out["cls"].float()
+        res = self.patchcore.predict(cls, patch, cls_tok, return_map=return_map)
         return res
 
     def _dino_tta_forward(self, views: torch.Tensor, cls: str
@@ -216,16 +250,16 @@ class CSIGAnomalyPipeline:
             w_list.append(self.cfg.tta_weight_orig if name == "orig" else self.cfg.tta_weight_flip)
         w = torch.tensor(w_list, device=views.device, dtype=views.dtype)
         wsum = w.sum()
-        # Weighted average over TTA augmentations (per-view)
         w_map = w.view(-1, 1, 1, 1)
-        dino_map = (torch.stack(map_acc, 0) * w_map).sum(0) / wsum     # (V, H, W)
+        stacked_maps = torch.stack(map_acc, 0)
+        dino_map = (stacked_maps * w_map).sum(0) / wsum     # (V, H, W)
         w_img = w.view(-1, 1)
-        pv = (torch.stack(img_acc, 0) * w_img).sum(0) / wsum           # (V,)
-        # Sample-level image score: robust mean over views (identical to
-        # how the calibrator was fitted).
+        stacked_imgs = torch.stack(img_acc, 0)
+        pv = (stacked_imgs * w_img).sum(0) / wsum           # (V,)
         img_raw = aggregate_image_scores(
             pv.unsqueeze(0), strategy=self.cfg.mv_aggregate
         )  # (1,)
+        del stacked_maps, stacked_imgs, map_acc, img_acc
         return img_raw, dino_map
 
     # ------------------------------------------------------------------
@@ -245,57 +279,69 @@ class CSIGAnomalyPipeline:
 
         clip_patch_accum: Dict[str, List[torch.Tensor]] = {}
 
+        # ---- Phase 1: extract DINO patch/CLS features ----
         for batch in tqdm(loader, desc="fit/dino"):
             imgs = batch["image"].to(self.device, non_blocking=True)
             cls_names = batch["cls_name"]
-            out = self._run_backbone(self.dino, imgs)
-            patch = out["patch"].cpu()
-            cls_tok = out["cls"].cpu()
+            with self._autocast_ctx():
+                out = self._run_backbone(self.dino, imgs)
+            # Cast back to fp32 for storage & kNN; move to CPU immediately.
+            patch = out["patch"].float().cpu()
+            cls_tok = out["cls"].float().cpu()
             for b in range(imgs.shape[0]):
                 c = cls_names[b]
                 self.patchcore.add(c, patch[b:b+1], cls_tok[b:b+1])
+            del imgs, out, patch, cls_tok
+        self._empty_cache()
 
+        # ---- Phase 2: build CLIP reference bank (smaller batch, fp16) ----
         if self.clip is not None:
-            # Build the WinCLIP reference bank at the SAME resolution as
-            # test-time inference (input_size, usually 448).  The CLIP ViT
-            # handles non-native resolutions via bicubic pos-embed interp
-            # (see CLIPFeatureExtractor.encode_image), and running at
-            # 448px gives a denser 32x32 patch grid (vs 24x24 at 336px)
-            # that aligns pixel-exactly with the DINOv2 448/14=32x32 grid,
-            # making the mask ensemble spatially registered.
+            # Using input_size CLIP-normalised images gives a 32x32 patch
+            # grid that aligns pixel-exactly with DINO's 32x32 grid.
             clip_tfm = build_train_transform(self.cfg.input_size, norm="clip")
             ds_c = CSIGImageDataset(train_root, transform=clip_tfm, classes=self.classes)
-            ld_c = DataLoader(ds_c, batch_size=self.cfg.batch_size, shuffle=False,
+            clip_bs = max(1, min(self.cfg.clip_batch_size, self.cfg.batch_size))
+            ld_c = DataLoader(ds_c, batch_size=clip_bs, shuffle=False,
                               num_workers=self.cfg.num_workers, pin_memory=True)
             print("[fit] Building WinCLIP reference banks ...")
             for batch in tqdm(ld_c, desc="fit/clip"):
                 imgs = batch["image"].to(self.device, non_blocking=True)
                 cls_names = batch["cls_name"]
-                cout = self._run_backbone(self.clip, imgs, call="encode_image")
+                with self._autocast_ctx():
+                    cout = self._run_backbone(self.clip, imgs, call="encode_image")
                 for b in range(imgs.shape[0]):
                     c = cls_names[b]
-                    Dc = cout["patch"].shape[1]
-                    p = cout["patch"][b].permute(1, 2, 0).reshape(-1, Dc)
+                    p = cout["patch"][b].float().permute(1, 2, 0).reshape(-1, cout["patch"].shape[1])
                     clip_patch_accum.setdefault(c, []).append(p.cpu())
+                del imgs, cout
+            self._empty_cache()
             for c, ps in clip_patch_accum.items():
                 allp = torch.cat(ps, dim=0)
+                # build_winclip_reference does random sampling (no GPU needed)
                 self.clip_refs[c] = build_winclip_reference(self.clip, allp, n_select=2048)
+            del clip_patch_accum
+            self._empty_cache()
 
+        # ---- Phase 3: coreset subsampling. Run on CPU by default
+        # (greedy_coreset supports CUDA but on 16GB cards the intermediate
+        # [N, 256] RP matrix + distance tensors can push us over).
         print("[fit] Building coreset memory banks ...")
-        self.patchcore.build(device=self.device)
+        coreset_dev = "cpu"
+        try:
+            self.patchcore.build(device=coreset_dev, bank_device="cpu")
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e) or "out of memory" in str(e):
+                self._empty_cache()
+                print("[fit] coreset on CUDA failed, retrying on CPU ...")
+                self.patchcore.build(device="cpu", bank_device="cpu")
+            else:
+                raise
+        self._empty_cache()
 
-        # ---- Calibration pass on training samples ----
-        # IMPORTANT: this pass uses the IDENTICAL DINO+TTA score formula used
-        # at inference (same TTA flips with same weights, same mv_aggregate,
-        # same cls/prototype blending) so the p50/p95 percentiles we fit
-        # correctly align with the test-time score distribution.
-        # CLIP branch is NOT used in calibration because (a) WinCLIP image
-        # scores on known-class normals are already near 0 (well-calibrated),
-        # (b) running CLIP + winclip on train doubles feature-extraction
-        # cost for marginal gain, and (c) the DINO calibrator's z-score is
-        # blended with CLIP's [0,1] score only AFTER calibration.
+        # ---- Phase 4: calibration (per-sample TTA loop) ----
         print("[fit] Calibrating per-class score distributions on train ...")
         self._calibrate_on_train(train_root, tfm)
+        self._empty_cache()
 
     @torch.no_grad()
     def _calibrate_on_train(self, train_root: Path, tfm):
@@ -377,22 +423,34 @@ class CSIGAnomalyPipeline:
         clip_img_score = torch.zeros_like(dino_img_score)
         clip_map = torch.zeros_like(dino_map_norm)
         if self.clip is not None and views_clip is not None:
-            cout = self._run_backbone(self.clip, views_clip, call="encode_image")
             ref = self.clip_refs.get(cls, None)
-            # Lazily migrate the per-class reference bank to the current
-            # device once (saves the .to() on every subsequent sample).
             if ref is not None and ref.device != views_clip.device:
                 ref = ref.to(views_clip.device)
                 self.clip_refs[cls] = ref
+            # Micro-batch CLIP forward to bound activation memory
+            # (ViT-L/14 at 448px uses ~1.3 GB/view in fp16).
+            all_patch = []
+            all_cls = []
+            micro = 2
+            for i in range(0, views_clip.shape[0], micro):
+                sub = views_clip[i:i+micro]
+                with self._autocast_ctx():
+                    cout_sub = self.clip.encode_image(sub)
+                all_patch.append(cout_sub["patch"].float())
+                all_cls.append(cout_sub["cls"].float())
+                del sub, cout_sub
+            cout = {
+                "patch": torch.cat(all_patch, dim=0),
+                "cls": torch.cat(all_cls, dim=0),
+            }
             wc = winclip_score(self.clip, cout["patch"], cout["cls"],
                                cls, reference_patches=ref, alpha=0.5)
             cm = wc["anomaly_map"].unsqueeze(1)            # (V,1,Hp_c,Wp_c)
             cm = bilinear_upsample(cm, self.cfg.input_size)
             cm = gaussian_smooth2d(cm, kernel_size=7, sigma=3.0)
             clip_map = cm[:, 0].clamp(0.0, 1.0)            # (V,448,448)
-            # Per-view WinCLIP scores are already in [0,1] (ReLU'd cos sim
-            # for text, (1-cos)/2 for ref). Use mean over views.
             clip_img_score = wc["image_score"].mean().unsqueeze(0).clamp(0.0, 1.0)
+            del cout, all_patch, all_cls, wc, cm
 
         # ---- Ensemble (both maps are now in [0,1]) ----
         wd = self.cfg.ens_dino_weight
@@ -425,9 +483,23 @@ class CSIGAnomalyPipeline:
         loader = DataLoader(ds, batch_size=1, shuffle=False,
                             num_workers=self.cfg.num_workers, pin_memory=True)
 
-        rows: List[Tuple[str, float]] = []
+        # Prefetch memory banks to GPU once before the loop (faster).
+        # On GPUs with <16GB memory, set bank_device="cpu" via the build
+        # call and skip prefetch -- banks will be migrated lazily per
+        # call and evicted below.
         print(f"[predict] Running inference on {len(ds)} test samples ...")
+        try:
+            # Try prefetching; if it OOMs, fall back to lazy migration.
+            self.patchcore.banks_to_device(self.device)
+            banks_prefetched = True
+            print(f"[predict] Coreset banks prefetched to {self.device}")
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            banks_prefetched = False
+            print("[predict] Prefetch OOM -- falling back to lazy bank migration")
+        self._empty_cache()
 
+        rows: List[Tuple[str, float]] = []
         for batch in tqdm(loader, desc="predict"):
             views = batch["views"].squeeze(0).to(self.device)
             cls = batch["cls_name"][0]
@@ -436,18 +508,6 @@ class CSIGAnomalyPipeline:
 
             views_clip = None
             if self.clip is not None:
-                # Produce a CLIP-normalised view at the SAME 448px resolution
-                # as the DINO branch.  This:
-                #   (1) preserves pixel-exact spatial alignment with dino_map
-                #       → better mask ensemble;
-                #   (2) avoids a double-resize (448 -> 336 at inference but
-                #       directly 336 at train) that would create a
-                #       train/test anti-aliasing mismatch;
-                #   (3) gives CLIP a denser 32x32 patch grid (448/14=32 for
-                #       ViT-L/14-336, which internally uses patch_size=14
-                #       — see open_clip ViT-L-14-336 config).
-                # CLIP's pos-embed is bicubic-interpolated automatically
-                # in CLIPFeatureExtractor.encode_image.
                 views_clip = _imagenet_to_clip(views)
 
             if cls in self.patchcore.banks:
@@ -464,6 +524,21 @@ class CSIGAnomalyPipeline:
                               target_size=self.cfg.input_size,
                               global_lo=0.0, global_hi=1.0)
 
+            # Per-sample cleanup
+            del views, views_clip
+            if not banks_prefetched:
+                # Evict this class' bank back to CPU after use so we only
+                # ever have one class coreset resident on GPU at a time.
+                bk = self.patchcore.banks.get(cls, None)
+                if bk is not None and bk.features.device.type == "cuda":
+                    bk.features = bk.features.to("cpu")
+                    bk.cls_prototype = bk.cls_prototype.to("cpu")
+            self._empty_cache()
+
+        # Evict banks back to CPU at the end.
+        self.patchcore.banks_to_cpu()
+        self._empty_cache()
+
         csv_path = out_dir / "submission.csv"
         save_submission_csv(rows, csv_path)
         print(f"[predict] Saved {len(rows)} rows to {csv_path}")
@@ -475,7 +550,20 @@ class CSIGAnomalyPipeline:
                           cls: str) -> Tuple[float, np.ndarray]:
         """Fallback for unseen classes: pure WinCLIP (no memory bank)."""
         assert self.clip is not None, "Zero-shot requires CLIP backbone."
-        cout = self._run_backbone(self.clip, views_clip, call="encode_image")
+        # micro-batch CLIP forward to control activation memory
+        all_patch, all_cls = [], []
+        micro = 2
+        for i in range(0, views_clip.shape[0], micro):
+            sub = views_clip[i:i+micro]
+            with self._autocast_ctx():
+                cout_sub = self.clip.encode_image(sub)
+            all_patch.append(cout_sub["patch"].float())
+            all_cls.append(cout_sub["cls"].float())
+            del sub, cout_sub
+        cout = {
+            "patch": torch.cat(all_patch, 0),
+            "cls": torch.cat(all_cls, 0),
+        }
         wc = winclip_score(self.clip, cout["patch"], cout["cls"], cls,
                            reference_patches=None, alpha=1.0)
         cm = wc["anomaly_map"].unsqueeze(1)
@@ -484,10 +572,6 @@ class CSIGAnomalyPipeline:
         cmap = cm[:, 0].clamp(0.0, 1.0)
         cmap = multiview_mask_vote(cmap.unsqueeze(0)).squeeze(0)
         img_score = wc["image_score"]  # (V,) in [0,1]
-        # For zero-shot classes we have no training statistics, so we
-        # return the per-view mean as the image-level score. Per-sample
-        # median-centering is avoided because with only 5 views it always
-        # pushes the top view to ~1 and the bottom to ~0, destroying the
-        # ranking between normal and abnormal samples.
         cal_score = float(img_score.mean().clamp(0.0, 1.0).item())
+        del cout, wc, cm, all_patch, all_cls
         return cal_score, cmap.clamp(0, 1).cpu().numpy()

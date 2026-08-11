@@ -418,4 +418,3 @@ class CLIPFeatureExtractor(nn.Module):
         tok = open_clip.tokenize(prompts).to(device)
         feats = self.model.encode_text(tok)
         return F.normalize(feats, dim=-1)
-

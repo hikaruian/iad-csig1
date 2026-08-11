@@ -208,13 +208,14 @@ class MultiClassPatchCore:
         """Finalize all per-class banks (coreset subsampling).
 
         Args:
-            device: compute device used for coreset selection (we recommend
-                a CUDA device here for speed; falls back to CPU if not given).
-            bank_device: where to STORE the finalised bank tensors. Keeping
-                banks on CPU ("cpu", default) saves ~3 GB of GPU VRAM for
-                50-class × 16k × 1024-d banks; chunks are moved to the active
-                GPU on each ``predict()`` call. Set to ``"cuda"`` for a small
-                speedup if you have ≥32 GB GPU memory.
+            device: compute device used for coreset selection.
+            bank_device: where to STORE the finalised bank tensors.
+                "cpu" (default, safest): banks live on CPU and are lazily
+                moved to the active GPU on each ``predict()`` call. Use
+                ``banks_to_device()`` / ``banks_to_cpu()`` to explicitly
+                prefetch / evict.
+                "cuda": ~3 GB for 50 classes × 16k × 1024-d fp32; gives a
+                small speedup if you have ≥24 GB GPU memory.
         """
         # If no device specified and CUDA is available, use it for coreset
         # selection (it's 10-100× faster than CPU).
@@ -231,7 +232,6 @@ class MultiClassPatchCore:
                 self.coreset_max,
                 max(1024, int(self.coreset_ratio * all_feats.shape[0])),
             )
-            # Run greedy coreset on compute_dev for speed, then move to bank_device
             bank = greedy_coreset(all_feats, n_select=n_select,
                                   random_proj_dim=self.random_proj_dim,
                                   device=compute_dev)
@@ -247,6 +247,24 @@ class MultiClassPatchCore:
         self._raw_features.clear()
         self._raw_cls.clear()
 
+    def banks_to_device(self, device: str | torch.device = "cuda"):
+        """Prefetch all banks to ``device``. Call once before a prediction
+        loop to get the best throughput; pairs with ``banks_to_cpu()``."""
+        dev = torch.device(device)
+        for bank in self.banks.values():
+            if bank.features.device != dev:
+                bank.features = bank.features.to(dev)
+                bank.cls_prototype = bank.cls_prototype.to(dev)
+
+    def banks_to_cpu(self):
+        """Evict all banks back to CPU to free GPU memory."""
+        for bank in self.banks.values():
+            if bank.features.device.type != "cpu":
+                bank.features = bank.features.to("cpu")
+                bank.cls_prototype = bank.cls_prototype.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # ---- inference ----------------------------------------------------------
     def _nearest_neighbour_distance(self, q: Tensor, bank: Tensor) -> Tensor:
         """
@@ -260,7 +278,6 @@ class MultiClassPatchCore:
         for i in range(0, q.shape[0], chunk):
             qc = q[i:i+chunk]  # (c, D)
             sim = qc @ bank.t()  # (c, M) cosine similarity
-            # Top-k largest similarities
             topk_sim = sim.topk(self.n_neighbours, dim=1).values.mean(1)
             d_min[i:i+chunk] = 1.0 - topk_sim
         return d_min
@@ -276,15 +293,25 @@ class MultiClassPatchCore:
         """
         assert cls in self.banks, f"Class {cls} not in memory bank"
         bank = self.banks[cls]
-        # Banks are pre-loaded onto the device at build() time, but if the
-        # user calls predict() on a different device we move them lazily.
-        if bank.features.device != patch_feat.device:
-            bank.features = bank.features.to(patch_feat.device)
-            bank.cls_prototype = bank.cls_prototype.to(patch_feat.device)
+        dev = patch_feat.device
+        # Lazy GPU migration of this class' bank. We do NOT auto-evict
+        # here -- call banks_to_cpu() explicitly when you're done with
+        # a prediction loop to free GPU memory.
+        if bank.features.device != dev:
+            bank.features = bank.features.to(dev)
+            bank.cls_prototype = bank.cls_prototype.to(dev)
         bank_feats = bank.features
-        B, D, Hp, Wp = patch_feat.shape
 
-        flat_p, _, _ = reshape_patch_features(patch_feat)  # (B*Hp*Wp, D)
+        # Make sure bank is in fp32 for the kNN matmul (fp16 matmul of
+        # L2-normed vectors can give cos > 1 due to rounding, producing
+        # negative distances).
+        if bank_feats.dtype != torch.float32:
+            bank_feats = bank_feats.float()
+        if cls_feat.dtype != torch.float32:
+            cls_feat = cls_feat.float()
+
+        B, D, Hp, Wp = patch_feat.shape
+        flat_p = patch_feat.float().permute(0, 2, 3, 1).reshape(-1, D)
         d = self._nearest_neighbour_distance(flat_p, bank_feats)
         amap = d.reshape(B, 1, Hp, Wp)
 
@@ -304,7 +331,7 @@ class MultiClassPatchCore:
 
         # (3) Image score: weighted blend of (a) patch-level max distance
         # and (b) CLS-token distance to the class prototype.
-        # NOTE: both terms are in the SAME scale ([0,2]) because features
+        # Both terms are in the SAME scale ([0,2]) because features
         # and prototype are L2-normalised (dot = cos sim ∈ [-1,1]).
         patch_score = amap_hr.flatten(1).max(dim=1).values  # (B,)
         proto = bank.cls_prototype
@@ -312,6 +339,8 @@ class MultiClassPatchCore:
             proto = proto.unsqueeze(-1)  # (D,1)
         else:
             proto = proto.reshape(-1, 1)
+        if proto.dtype != torch.float32:
+            proto = proto.float()
         cls_dist = 1.0 - (cls_feat @ proto).squeeze(-1)  # (B,)
         img_score = (1.0 - self.cls_bank_weight) * patch_score \
                   + self.cls_bank_weight * cls_dist

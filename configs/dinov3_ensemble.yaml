@@ -50,7 +50,9 @@ tta_weight_flip: 0.5
 ens_dino_weight: 0.75
 ens_clip_weight: 0.25
 
-batch_size: 4
+batch_size: 2
+clip_batch_size: 1
 num_workers: 8
+use_amp: true
 device: "cuda"
 seed: 42

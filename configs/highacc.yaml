@@ -1,8 +1,10 @@
-# Highest-accuracy config (slower, needs ~32GB GPU).
-# Use DINOv2-G/14 with multi-scale input (448 + 630) averaged and a bigger
-# memory bank, plus stronger CLIP ensemble.
+# Highest-accuracy config (slower, needs ~24GB GPU at 448px; if you hit OOM
+# at 518px, either drop input_size back to 448 or set batch_size=1 / clip_batch_size=1).
+# Uses DINOv2-g/14 with deeper layers and a bigger memory bank, plus stronger
+# CLIP ensemble.
+
 dinov2_model: "vitg14"
-dinov2_layers: [16, 20, 22, 23, 24, 27, 31, 35, 39]   # last 9 blocks of ViT-G/40
+dinov2_layers: [16, 20, 22, 23, 24, 27, 31, 35, 39]   # last 9 blocks of ViT-g/40
 input_size: 518           # 518 / 14 = 37, integer grid
 
 use_clip: true
@@ -28,7 +30,9 @@ tta_weight_flip: 0.6
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
-batch_size: 2
+batch_size: 1
+clip_batch_size: 1
 num_workers: 8
+use_amp: true
 device: "cuda"
 seed: 42

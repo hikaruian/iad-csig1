@@ -91,7 +91,9 @@ def auto_parallel_forward(module: torch.nn.Module,
         fn = module if call == "__call__" else getattr(module, call)
         return fn(x, **kwargs)
 
-    # Cache shallow copies of the unwrapped module per GPU.
+    base_dev = x.device if x.device.type == "cuda" else torch.device("cuda:0")
+    src_dev_id = base_dev.index if base_dev.index is not None else 0
+
     cache = getattr(auto_parallel_forward, "_cache", None)
     if cache is None:
         cache = {}
@@ -102,19 +104,33 @@ def auto_parallel_forward(module: torch.nn.Module,
         fn = module if call == "__call__" else getattr(module, call)
         return fn(x, **kwargs)
 
-    base_dev = x.device if x.device.type == "cuda" else torch.device("cuda:0")
     chunk_size = (B + n - 1) // n
     outputs = []
+    # Lazily build one replica per GPU. CRITICAL: for the replica that
+    # lives on the source device (where ``module`` already resides),
+    # reuse ``module`` itself instead of deep-copying it -- otherwise
+    # cuda:0 would hold two copies of DINOv2-L + CLIP (~6GB extra) and
+    # instantly OOM on 16GB cards.
+    used_devices = []
+    chunks_meta = []
     for i in range(n):
         s, e = i * chunk_size, min(B, (i + 1) * chunk_size)
         if s >= e:
             continue
         dev = torch.device(f"cuda:{i}")
-        key = (id(unwrap(module)), i, call)
+        used_devices.append(dev)
+        chunks_meta.append((s, e, dev))
+
+    for (s, e, dev) in chunks_meta:
+        key = (id(unwrap(module)), dev.index, call)
         if key not in cache:
-            m_copy = copy.deepcopy(unwrap(module)).to(dev).eval()
-            for p in m_copy.parameters():
-                p.requires_grad_(False)
+            src = unwrap(module)
+            if dev.index == src_dev_id:
+                m_copy = src  # reuse original, NO extra copy on base GPU
+            else:
+                m_copy = copy.deepcopy(src).to(dev).eval()
+                for p in m_copy.parameters():
+                    p.requires_grad_(False)
             cache[key] = m_copy
         m_copy = cache[key]
         chunk = x[s:e].to(dev, non_blocking=True)
