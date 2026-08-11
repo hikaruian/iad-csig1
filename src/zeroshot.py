@@ -46,8 +46,10 @@ _DEFECT_TEMPLATES = [
 
 
 def build_text_prompts(class_name: str) -> Tuple[List[str], List[str]]:
-    norm = [t.format(class_name) for t in _NORMAL_TEMPLATES]
-    defc = [t.format(class_name) for t in _DEFECT_TEMPLATES]
+    # Convert snake_case / directory names to natural English for CLIP.
+    pretty = class_name.replace("_", " ").replace("-", " ").strip()
+    norm = [t.format(pretty) for t in _NORMAL_TEMPLATES]
+    defc = [t.format(pretty) for t in _DEFECT_TEMPLATES]
     return norm, defc
 
 
@@ -81,34 +83,45 @@ def winclip_score(clip_model, patch_feat: torch.Tensor,
         anomaly_map (B, Hp, Wp)
     """
     device = patch_feat.device
-    norm_prompts, defc_prompts = build_text_prompts(class_name)
-    norm_text = clip_model.encode_text(norm_prompts).mean(0)  # (D,)
-    defc_text = clip_model.encode_text(defc_prompts).mean(0)  # (D,)
-    norm_text = _normalize(norm_text, dim=0)
-    defc_text = _normalize(defc_text, dim=0)
-    delta = defc_text - norm_text  # defect direction in CLIP space
+
+    # --- Text embedding cache (per-class, computed once per process) ----
+    # encode_text() is cheap but not free; with 50 classes × 750 samples
+    # recomputing every forward pass wastes ~30s per run.
+    cache = getattr(winclip_score, "_text_cache", None)
+    if cache is None:
+        cache = {}
+        winclip_score._text_cache = cache
+    if class_name not in cache:
+        norm_prompts, defc_prompts = build_text_prompts(class_name)
+        norm_text = _normalize(clip_model.encode_text(norm_prompts).mean(0), dim=-1)
+        defc_text = _normalize(clip_model.encode_text(defc_prompts).mean(0), dim=-1)
+        delta = _normalize(defc_text - norm_text, dim=-1)
+        cache[class_name] = delta
+    delta = cache[class_name].to(device)
 
     B, D, Hp, Wp = patch_feat.shape
     flat = patch_feat.permute(0, 2, 3, 1).reshape(-1, D)  # (B*N, D)
 
-    # Text-direction alignment (cosine with defect direction)
+    # Text-direction alignment (cosine with defect direction). Range ~[-1,1].
     sim_text = (flat @ delta.unsqueeze(1)).squeeze(1)  # (B*N,)
-    map_text = sim_text.reshape(B, Hp, Wp)
+    # Map to non-negative "anomalousness" via ReLU on the positive half (WinCLIP
+    # trick: patches pointing toward the defect direction are anomalous).
+    map_text = F.relu(sim_text).reshape(B, Hp, Wp)
 
-    # Reference-bank alignment: distance to nearest normal patch
+    # Reference-bank alignment: distance to nearest normal patch, range [0,2]
+    # (since cosine sim in [-1,1]); normalise to [0,1] by multiplying by 0.5.
     if reference_patches is not None and reference_patches.numel() > 0:
         ref = reference_patches.to(device)
         sim_ref = flat @ ref.t()            # (B*N, M) cosine
-        d_ref = 1.0 - sim_ref.max(1).values # (B*N,)
+        d_ref = (1.0 - sim_ref.max(1).values) * 0.5  # (B*N,) in [0,1]
         map_ref = d_ref.reshape(B, Hp, Wp)
         amap = alpha * map_text + (1 - alpha) * map_ref
     else:
         amap = map_text
 
-    # Image score = max over map
+    # Image score = per-view max over spatial map
     img_score = amap.reshape(B, -1).max(dim=1).values
 
-    # Normalise to [0,1] globally (per-batch percentile-clip is handled later)
     return {"image_score": img_score, "anomaly_map": amap}
 
 

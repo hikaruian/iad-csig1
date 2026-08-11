@@ -1,78 +1,45 @@
-# Champion config (A榜最终冲榜推荐)
-# =====================================
-# 综合 2024-2026 SOTA 所有高 ROI 改进：
-#   1. DINOv2-L/14 主骨干 + DINOv3-L/16 像素级集成
-#   2. CLIP ViT-L/14-336 + DMA 特征级融合（而非简单分数加权）
-#   3. 前景掩码（DINOv2 自注意力分割，抑制背景虚警 ~+5 I-AUROC）
-#   4. 高分辨率滑窗推理（window=448, stride=224）— 解决原图 4400px 微小缺陷被 resize 毁掉的问题
-#   5. Dinomaly-Lite 轻量重建分支（~8M 参数，仅正常样本训练，S_knn 与 S_recon 几何平均）
-#   6. Cross-view attention + Mask Voting + Robust-Mean 多视角融合
-#   7. TTA 翻转×4 加权
-#   8. Per-class 百分位校准
+# =============================================================================
+# Champion config (A榜冲榜推荐)
+# =============================================================================
+# 本配置可直接通过 `python run.py --data CSIG --out sub_champ --config configs/champion.yaml` 运行，
+# 所有字段均已在 PipelineConfig 中实现并经过基本 bug 修复。
 #
-# 资源预估：单卡 24GB（A100/4090），训练 ~45min，推理 ~2~3h（主要是滑窗成本）
-# 预期分数（参考 Real-IAD Variety 官方 benchmark 上各组件的可叠加增益）：
-#   相对 default.yaml 配置预估 I-AUROC +5~8pp / P-AUPR +6~10pp
+# 相对 default.yaml 的变化：
+#   * 更大的 coreset (32k)，更多 nearest neighbours (9)，更大平滑核
+#   * TTA 翻转权重更均衡 (0.6)，mask voting beta 提高到 2.0
+#   * batch_size=2 以适配 24GB 显卡 + 更大负载
+#   * CLIP 分支权重 0.3（比默认略高，利用语义互补）
+#
+# 以下高级模块已以独立类/函数形式实现于 src/ 目录中，但**未接入默认 pipeline 路径**
+# （因为完整集成需要更复杂的fit/predict流程与额外训练时间），有经验的用户可自行接入：
+#   - src/dinomaly_lite.py     : LooseDecoder 重建分支 (需额外训练 ~10 min)
+#   - src/foreground.py        : DINOv2 CLS-patch 前景掩码
+#   - src/fusion.py            : DMA 双模态特征级融合
+#   - src/hr_sliding.py        : 高分辨率滑窗推理 (适合 >896px 的原图)
+#   - src/anoco.py             : ANoCo 拉普拉斯非共形评分器
+#   - src/postprocess.py       : ZCA 白化 / 自适应归一化
+#   - src/competition_tricks.py: GMM 后处理 / 连通域降噪 / 多尺度 TTA
+#   - src/secret_sauce.py      : hard-negative mining / transductive whitening / gamma 0.6
+# 以上模块接入后预期再 +2~4pp，但需要修改 pipeline.py 的 fit/_predict_one_sample 流程。
+# =============================================================================
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
 
-use_dinov3: true
-dinov3_variant: "l16_493"
-dinov3_layers: [18, 19, 20, 21, 22, 23]
-
 input_size: 448
-# --- High-resolution sliding window ---
-use_sliding_window: true
-sw_window: 448
-sw_stride: 224       # 50% overlap, standard in EfficientAD / AnomalyDINO
-sw_sigma: ~  # null -> auto = window/4
-# On multi-view samples: run SW on each view, then vote.
-sw_only_when_large: true  # only engage SW when any dimension > 896
-sw_threshold_px: 896
 
 use_clip: true
 clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
-# DMA feature-level fusion (not just score blending)
-use_dma_fusion: true
-dma_align_epochs: 5
-dma_theta: 0.5
 
-# --- Foreground suppression ---
-use_foreground_mask: true
-fg_percentile: 35
-fg_lambda: 0.15
-
-# --- Dinomaly-Lite reconstruction branch ---
-use_recon_branch: true
-recon_epochs: 30
-recon_lr: 0.0002
-recon_weight: 0.5    # S_final = sqrt(S_knn * S_recon)  (geometric mean)
-recon_bottleneck: 512
-recon_drop: 0.3
-
-# --- PatchCore hyperparams ---
+# --- PatchCore hyperparams (tuned for 50-class multi-industry) ---
 coreset_ratio: 0.03
-coreset_max: 16384
+coreset_max: 32768
 neighbourhood_size: 3
-n_neighbours: 5
-smooth_kernel: 9
-smooth_sigma: 4.0
+n_neighbours: 9
+smooth_kernel: 11
+smooth_sigma: 4.5
 cls_bank_weight: 0.25
-
-# --- ANoCo (CVPR 2026) Laplacian non-conformity scorer ---
-use_anoco: true
-anoco_k: 5
-anoco_tau: 0.1
-anoco_mu: 10.0
-# ensemble weights for s_knn, s_anoco, s_recon (geometric mean)
-score_weights: [0.34, 0.33, 0.33]
-
-# --- Whitening + adaptive calibration ---
-use_whitening: true
-whiten_eps: 0.001
-ttad_alpha: 0.5   # convex combination of train/test percentiles
 
 # --- Multi-view ---
 mv_aggregate: "robust_mean"
@@ -88,7 +55,7 @@ tta_weight_flip: 0.6
 ens_dino_weight: 0.7
 ens_clip_weight: 0.3
 
-batch_size: 2       # smaller batch when using reconstruction / SW
+batch_size: 2
 num_workers: 8
 device: "cuda"
 seed: 42

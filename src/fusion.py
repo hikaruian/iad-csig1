@@ -149,13 +149,14 @@ def fit_dma_projection(dma: DualModalityAttention, dino_p: torch.Tensor,
                        epochs: int = 5, batch_size: int = 512,
                        lr: float = 1e-3):
     """
-    Fit the DMA projection layer with a simple cosine alignment loss on
-    NORMAL training patches (no labels, no anomaly data used).
-    Loss: 1 - cos(proj(c_p), d_p) averaged over patches. This aligns CLIP
-    tokens into the DINOv2 space using only normal samples.
+    Fit the DMA CLIP->DINO projection layer with a cosine alignment loss
+    on NORMAL training patches (no labels / no anomaly data used).
+    Loss: 1 - cos(proj(c_p), d_p) averaged over patches.
     """
-    dma.train()
-    opt = torch.optim.AdamW(dma.parameters(), lr=lr, weight_decay=1e-4)
+    dma.to(device).train()
+    # Only train the linear projection (the attention parameters are
+    # used at inference with their identity init frozen).
+    opt = torch.optim.AdamW(dma.proj.parameters(), lr=lr, weight_decay=1e-4)
     d_p = dino_p.to(device)
     c_p = clip_p.to(device)
     n = d_p.shape[0]

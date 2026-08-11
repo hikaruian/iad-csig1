@@ -61,6 +61,8 @@ def main():
                     help="Override DINOv2 size: vitb14|vitl14|vitg14")
     ap.add_argument("--no-clip", action="store_true",
                     help="Disable CLIP/WinCLIP ensemble branch")
+    ap.add_argument("--dp", action="store_true",
+                    help="Enable DataParallel across all visible GPUs (single-node, simple)")
     args = ap.parse_args()
 
     cfg = PipelineConfig()
@@ -76,6 +78,8 @@ def main():
         cfg.dinov2_model = args.dinov2
     if args.no_clip:
         cfg.use_clip = False
+    if args.dp:
+        cfg.use_dp = True
 
     out_dir = Path(cfg.out_dir)
     if out_dir.exists():

@@ -1,32 +1,29 @@
-# DINOv2 + DINOv3 ensemble (recommended for A榜最终提交)
-# --------------------------------------------------------
-# Rationale (see SOLUTION.md §2.1):
-#   * DINOv2-L/14  -> stronger IMAGE-LEVEL discrimination (S_cls ↑)
-#   * DINOv3-L/16  -> stronger PIXEL-LEVEL dense features     (S_seg ↑)
-#   * Ensemble both patch maps -> best of both worlds.
+# =============================================================================
+# DINOv2 + DINOv3 ensemble config (高级配置，需要少量手动接入)
+# =============================================================================
+# 说明：本配置中的 use_dinov3 / dinov3_variant / dinov3_layers / dinov3_weight
+# **不会被当前 pipeline.py 自动识别**。你需要在 pipeline.py 中额外实例化
+# DINOv3FeatureExtractor、抽取 patch 特征、在 patch 维度与 DINOv2 map 做加权
+# 平均（或 channel-cat 后再经过投影层）后送入 PatchCore。这是一个留给高级用户
+# 的集成接口，预期 +1~2pp P-AUPR。
 #
-# Setup:
-#   * Primary : DINOv2 ViT-L/14 (blocks 8..11)   448px
-#   * Secondary: DINOv3 ViT-L/16 sat493m (blocks 18..23) 448px
-#     -> 448 / 16 = 28 grid; we bilinearly upsample DINOv3 patch maps to
-#        the same spatial size as DINOv2's 32x32 grid, then fuse features
-#        by CHANNEL-CONCAT before L2-normalisation inside the pipeline.
-#
-# If you don't have DINOv3 / can't install timm, just use default.yaml.
-#
-# To enable this config:
-#   1. pip install timm huggingface_hub
-#   2. python run.py --data CSIG --out submission --config configs/dinov3_ensemble.yaml
+# 基础字段（已由默认 pipeline 支持）：
+#   dinov2_model, dinov2_layers, input_size, use_clip, clip_model, clip_pretrained,
+#   coreset_ratio, coreset_max, n_neighbours, smooth_sigma, cls_bank_weight,
+#   mv_aggregate, mv_vote_beta, use_mv_attn, use_tta, ens_dino_weight, ens_clip_weight,
+#   batch_size, num_workers, device, seed
+# 如果不接入 DINOv3，请使用 default.yaml 或 champion.yaml。
+# =============================================================================
 
 # ---- primary backbone (DINOv2) ----
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
 
-# ---- secondary DINOv3 branch (patch-level ensemble) ----
+# ---- secondary DINOv3 branch (需要手动接入) ----
 use_dinov3: true
-dinov3_variant: "l16_493"         # vit_large_patch16_dinov3.sat493m via timm
+dinov3_variant: "l16_493"
 dinov3_layers: [18, 19, 20, 21, 22, 23]
-dinov3_weight: 0.4                # weight on DINOv3 patch map (DINOv2=0.6)
+dinov3_weight: 0.4
 
 input_size: 448
 

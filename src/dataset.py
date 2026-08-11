@@ -20,7 +20,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
@@ -28,35 +27,42 @@ from torchvision import transforms
 
 
 # ---------------------------------------------------------------------------
-# Base mean / std (ImageNet, compatible with DINOv2 & CLIP backbones)
+# Normalisation stats
 # ---------------------------------------------------------------------------
+# ImageNet stats (used for DINOv2 and for general ViT backbones)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+# CLIP uses its own mean/std (different from ImageNet)
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
-def build_train_transform(input_size: int = 448) -> transforms.Compose:
+
+def build_train_transform(input_size: int = 448,
+                           norm: str = "imagenet") -> transforms.Compose:
     """
     Training / feature extraction transform.
-    No aggressive augmentation is used during memory-bank construction:
-    we only do a deterministic resize + center-crop so that the bank stores
-    clean "normal" features. TTA is applied at inference time instead.
+    norm: "imagenet" for DINOv2, "clip" for OpenCLIP.
     """
+    mean = IMAGENET_MEAN if norm == "imagenet" else CLIP_MEAN
+    std = IMAGENET_STD if norm == "imagenet" else CLIP_STD
     return transforms.Compose([
         transforms.Resize((input_size, input_size),
                           interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
-def build_test_transform(input_size: int = 448, tta: str = "none") -> transforms.Compose:
+def build_test_transform(input_size: int = 448, tta: str = "none",
+                         norm: str = "imagenet") -> transforms.Compose:
     """
-    Inference transform. TTA variants:
-        * "none"  : deterministic resize
-        * "hflip" : horizontal flip (applied together with original in ensemble)
-        * "vflip" : vertical flip
-        * "hvflip": both flips
+    Inference transform.
+    norm: "imagenet" for DINOv2, "clip" for CLIP.
     """
+    mean = IMAGENET_MEAN if norm == "imagenet" else CLIP_MEAN
+    std = IMAGENET_STD if norm == "imagenet" else CLIP_STD
+
     ops: List[Callable] = [
         transforms.Resize((input_size, input_size),
                           interpolation=transforms.InterpolationMode.BICUBIC),
@@ -67,7 +73,7 @@ def build_test_transform(input_size: int = 448, tta: str = "none") -> transforms
         ops.append(transforms.RandomVerticalFlip(p=1.0))
     ops += [
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ]
     return transforms.Compose(ops)
 

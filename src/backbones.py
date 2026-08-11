@@ -6,19 +6,23 @@ Two backbones are supported:
 1. DINOv2 (default, primary)
    - facebookresearch/dinov2  (ViT-B/14, ViT-L/14, ViT-G/14)
    - Returns dense patch tokens + <[BOS_never_used_51bce0c785ca2f68081bfa7d91973934]> token.
-   - Multi-layer feature harvesting (layers 8,9,10,11 for viT-L) is used
-     to capture semantics + edges/textures, which is known to boost AD
-     (cf. Dinomaly / INP-Former / PatchCore-ML).
+   - Multi-layer feature harvesting: for ViT-L/14 (depth 24) we use layers
+     (8,9,10,11) which sit at the middle-to-late stage of the network – a
+     well-established choice for industrial AD (cf. INP-Former / Dinomaly)
+     because late layers are too semantics-oriented and lose fine-grained
+     texture information needed for localisation.
+   - A 1x1 ``fuse_proj`` Conv (eye/L-initialised) projects concatenated
+     multi-layer features back to embed_dim.
 
 2. OpenCLIP (secondary, for zero-shot WinCLIP-style ensemble)
-   - open_clip ViT-L/14 @ 336px (e.g. ViT-L-14-336-quickgelu)
+   - open_clip ViT-L-14 (patch_size=14, pretrained="openai" at 336px;
+     also supports running at 448px via bicubic pos-embed interpolation).
    - Provides CLS and patch tokens aligned with text embeddings,
      enabling WinCLIP-style compositional prompt ensembles.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -81,8 +85,24 @@ class DINOv2FeatureExtractor(nn.Module):
             assert 0 <= li < self.num_layers, \
                 f"layer index {li} out of range [0,{self.num_layers})"
 
+        # 1x1 conv projection to fuse multi-layer features back to D dims.
+        # Initialised to average the layers so first forward ≈ mean pooling.
+        in_ch = len(self.layers) * self.embed_dim
+        self.fuse_proj = nn.Conv2d(in_ch, self.embed_dim, kernel_size=1, bias=False)
+        nn.init.zeros_(self.fuse_proj.weight)
+        with torch.no_grad():
+            for i in range(len(self.layers)):
+                self.fuse_proj.weight[:, i*self.embed_dim:(i+1)*self.embed_dim, 0, 0] = \
+                    torch.eye(self.embed_dim) / len(self.layers)
+        for p in self.fuse_proj.parameters():
+            p.requires_grad_(False)
+
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self.extract_features(x)
+
+    @torch.no_grad()
+    def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Parameters
         ----------
@@ -100,19 +120,29 @@ class DINOv2FeatureExtractor(nn.Module):
             f"input H,W must be divisible by patch_size={self.patch_size}"
         Hp, Wp = H // self.patch_size, W // self.patch_size
 
-        # Prepare tokens following DINOv2's forward
+        # Prepare tokens following DINOv2's forward (handles CLS + optional
+        # register tokens that are prepended in newer DINOv2 checkpoints).
         x = self.model.prepare_tokens_with_masks(x)
+
+        # Newer DINOv2 checkpoints (e.g. dinov2_vitl14_reg) prepend extra
+        # register tokens between CLS and patch tokens. We detect their
+        # count so that we always slice the spatial patches correctly,
+        # rather than naively taking tokens[:, 1:] (which would mix in
+        # registers and produce garbage patch maps).
+        n_register = getattr(self.model, "n_register_tokens", 0)
+        patch_start = 1 + n_register
 
         patch_layers: List[torch.Tensor] = []
         cls_token = None
         for i, blk in enumerate(self.model.blocks):
             x = blk(x)
             if i in self.layers:
-                # tokens[:, 0] is CLS; tokens[:, 1:] are spatial patches
-                tokens = x  # (B, 1+Hp*Wp, D)
+                # tokens[:, patch_start:] are spatial patches only
+                tokens = x  # (B, 1+reg+Hp*Wp, D)
+                patch_tokens = tokens[:, patch_start:, :]
                 patch_layers.append(
-                    tokens[:, 1:].reshape(B, Hp, Wp, -1)
-                                  .permute(0, 3, 1, 2).contiguous()
+                    patch_tokens.reshape(B, Hp, Wp, -1)
+                                 .permute(0, 3, 1, 2).contiguous()
                 )
             if i == self.num_layers - 1:
                 cls_token = x[:, 0]
@@ -121,9 +151,9 @@ class DINOv2FeatureExtractor(nn.Module):
         # After final norm, overwrite the CLS token with the normalized one
         cls_token = x_norm[:, 0]
 
-        # Multi-layer fusion: channel-wise concatenation + 1x1 projection to D
+        # Multi-layer fusion: concat along channel, project to D, L2-normalise.
         fused = torch.cat(patch_layers, dim=1)  # (B, k*D, Hp, Wp)
-        # L2-normalise along channel to make cosine = dot in PatchCore
+        fused = self.fuse_proj(fused)
         fused = F.normalize(fused, dim=1)
 
         return {
@@ -200,11 +230,24 @@ class DINOv3FeatureExtractor(nn.Module):
         self.embed_dim = self.model.embed_dim
         self.num_layers = len(self.model.blocks)
 
-        # Register forward hooks to capture intermediate block outputs
-        self._captured: Dict[int, torch.Tensor] = {}
         for li in self.layers:
             assert 0 <= li < self.num_layers, \
                 f"DINOv3 layer {li} out of [0,{self.num_layers})"
+
+        # Multi-layer fusion projection (same average-init scheme as DINOv2).
+        in_ch = len(self.layers) * self.embed_dim
+        self.fuse_proj = nn.Conv2d(in_ch, self.embed_dim, kernel_size=1, bias=False)
+        nn.init.zeros_(self.fuse_proj.weight)
+        with torch.no_grad():
+            for i in range(len(self.layers)):
+                self.fuse_proj.weight[:, i*self.embed_dim:(i+1)*self.embed_dim, 0, 0] = \
+                    torch.eye(self.embed_dim) / len(self.layers)
+        for p in self.fuse_proj.parameters():
+            p.requires_grad_(False)
+
+        # Register forward hooks to capture intermediate block outputs
+        self._captured: Dict[int, torch.Tensor] = {}
+        for li in self.layers:
             self.model.blocks[li].register_forward_hook(
                 self._make_hook(li)
             )
@@ -246,6 +289,7 @@ class DINOv3FeatureExtractor(nn.Module):
             )
 
         fused = torch.cat(patch_layers, dim=1)
+        fused = self.fuse_proj(fused)
         fused = F.normalize(fused, dim=1)
         cls_tok = F.normalize(cls_tok, dim=-1)
 
@@ -292,6 +336,10 @@ class CLIPFeatureExtractor(nn.Module):
             self.visual_dim = self.embed_dim
 
     @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self.encode_image(x)
+
+    @torch.no_grad()
     def encode_image(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, _, H, W = x.shape
         Hp, Wp = H // self.patch_size, W // self.patch_size
@@ -299,35 +347,67 @@ class CLIPFeatureExtractor(nn.Module):
         visual = self.model.visual
         # Patch embedding
         x_vis = visual.conv1(x)  # (B, Dv, Hp, Wp)
-        x_vis = x_vis.reshape(B, -1, Hp * Wp).permute(0, 2, 1)  # (B, N, Dv)
+        x_vis = x_vis.reshape(B, x_vis.shape[1], -1).permute(0, 2, 1)  # (B, N, Dv)
 
         # Prepend CLS token
-        cls = visual.class_embedding.to(x.dtype).expand(B, 1, -1)
-        x_vis = torch.cat([cls, x_vis], dim=1)
-        x_vis = x_vis + visual.positional_embedding.to(x.dtype)
-        x_vis = visual.patch_dropout(x_vis)
+        cls = visual.class_embedding.to(x.dtype)
+        # open_clip's class_embedding is (D,) in all current versions;
+        # broadcast across the batch dimension.
+        if cls.dim() == 1:
+            cls = cls.view(1, 1, -1).expand(B, 1, -1)
+        else:
+            cls = cls.view(1, 1, -1).expand(B, -1, -1)
+        x_vis = torch.cat([cls, x_vis], dim=1)  # (B, 1+Hp*Wp, Dv)
+
+        # Positional embeddings. open_clip stores ``positional_embedding``
+        # as (1+N0, D) where N0 is the trained patch-grid count. We have to
+        # interpolate when the inference grid (Hp, Wp) differs from training.
+        pos = visual.positional_embedding.to(x.dtype)   # (1+N0, D)
+        if pos.dim() == 3:
+            # (1, 1+N0, D) in some checkpoint variants – squeeze batch dim
+            pos = pos.squeeze(0)
+        n0 = pos.shape[0] - 1
+        h0 = w0 = int(n0 ** 0.5)
+        if x_vis.shape[1] != pos.shape[0]:
+            pos_cls = pos[:1, :].unsqueeze(0)                          # (1, 1, D)
+            pos_patch = pos[1:, :]                                    # (N0, D)
+            pos_patch = pos_patch.reshape(1, h0, w0, -1).permute(0, 3, 1, 2)
+            pos_patch = F.interpolate(pos_patch, size=(Hp, Wp),
+                                      mode="bicubic", align_corners=False)
+            pos_patch = pos_patch.permute(0, 2, 3, 1).reshape(1, Hp * Wp, -1)
+            pos_use = torch.cat([pos_cls, pos_patch], dim=1)          # (1,1+Hp*Wp,D)
+        else:
+            pos_use = pos.unsqueeze(0)
+        x_vis = x_vis + pos_use
+
+        if hasattr(visual, "patch_dropout"):
+            x_vis = visual.patch_dropout(x_vis)
         x_vis = visual.ln_pre(x_vis)
         x_vis = x_vis.permute(1, 0, 2)  # (N+1, B, Dv) for transformer
-        x_vis = visual.transformer(x_vis, attn_mask=visual.attn_mask)
+        x_vis = visual.transformer(x_vis, attn_mask=getattr(visual, "attn_mask", None))
         x_vis = x_vis.permute(1, 0, 2)  # (B, N+1, Dv)
         x_vis = visual.ln_post(x_vis)
 
-        cls_tok = x_vis[:, 0] @ visual.proj  # (B, D)
-        patch_tok = x_vis[:, 1:]             # (B, N, Dv)
-        patch_tok = patch_tok @ visual.proj  # (B, N, D)
+        proj = getattr(visual, "proj", None)
+        if proj is not None:
+            patch_tok = x_vis[:, 1:] @ proj
+            cls_tok = x_vis[:, 0] @ proj
+        else:
+            patch_tok = x_vis[:, 1:]
+            cls_tok = x_vis[:, 0]
         patch_tok = F.normalize(patch_tok, dim=-1)
         cls_tok = F.normalize(cls_tok, dim=-1)
 
         return {
             "cls": cls_tok,
-            "patch": patch_tok.reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2),
+            "patch": patch_tok.reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2).contiguous(),
             "Hp": Hp, "Wp": Wp,
         }
 
     @torch.no_grad()
     def encode_text(self, prompts: List[str]) -> torch.Tensor:
         import open_clip
-        tok = self.tokenizer(prompts).to(next(self.model.parameters()).device)
+        device = next(self.model.parameters()).device
+        tok = open_clip.tokenize(prompts).to(device)
         feats = self.model.encode_text(tok)
-        feats = F.normalize(feats, dim=-1)
-        return feats
+        return F.normalize(feats, dim=-1)

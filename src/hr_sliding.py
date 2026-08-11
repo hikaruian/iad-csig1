@@ -40,8 +40,8 @@ class SlidingWindowInferer:
         self.ws = window_size
         self.stride = stride
         self.sigma = sigma if sigma is not None else window_size / 4.0
-        self.patch_stride = patch_output_stride  # ViT patch size -> 1 map pixel per patch
-        self.map_size = map_size  # size of anomaly map produced per window
+        self.patch_stride = patch_output_stride  # ViT patch size
+        self.map_size = map_size  # anomaly-map spatial size per window
 
     @torch.no_grad()
     def infer(self, image_hr: torch.Tensor, backbone, bank, cls_name: str,
@@ -55,42 +55,49 @@ class SlidingWindowInferer:
         C, H, W = image_hr.shape
         device = image_hr.device
         dtype = image_hr.dtype
+        ps = self.patch_stride
+        ws = self.ws
+        win_p = ws // ps  # patches per window, e.g. 448/14 = 32
 
-        # Accumulators in patch-grid coordinate space (lower resolution
-        # than HR but higher than a single 448 window): we first build a
-        # dense score map at stride = patch_stride relative to the original,
-        # then bilinearly upsample to (H, W).
-        H_p = H // self.patch_stride
-        W_p = W // self.patch_stride
-        score_acc = torch.zeros(1, 1, H_p, W_p, device=device, dtype=dtype)
-        count_acc = torch.zeros(1, 1, H_p, W_p, device=device, dtype=dtype)
-
-        # Gaussian weight per window (in patch-grid coordinates)
-        win_p = self.ws // self.patch_stride  # number of patches per window
-        gw = _gaussian_window(win_p, self.sigma / self.patch_stride,
-                              device=device, dtype=dtype)
+        # Gaussian blending kernel in patch-grid coordinates.
+        gw = _gaussian_window(win_p, self.sigma / ps, device=device, dtype=dtype)
         gw = gw.reshape(1, 1, win_p, win_p)
 
-        # Top-left corner positions (pixel level) in the original image
-        ys = list(range(0, max(1, H - self.ws + 1), self.stride))
-        xs = list(range(0, max(1, W - self.ws + 1), self.stride))
-        # Always include a final window flush with the bottom/right edge
-        if ys[-1] != H - self.ws: ys.append(H - self.ws)
-        if xs[-1] != W - self.ws: xs.append(W - self.ws)
+        # Pad image if smaller than window, and round padded size up to a
+        # multiple of ps so patch-grid indexing stays aligned.
+        pad_h = max(ws - H, 0)
+        pad_w = max(ws - W, 0)
+        pad_h += (- (H + pad_h)) % ps
+        pad_w += (- (W + pad_w)) % ps
+        if pad_h > 0 or pad_w > 0:
+            image_padded = F.pad(image_hr, (0, pad_w, 0, pad_h), mode="reflect")
+        else:
+            image_padded = image_hr
+        _, H_pad, W_pad = image_padded.shape
+
+        H_p_pad = H_pad // ps
+        W_p_pad = W_pad // ps
+        score_acc = torch.zeros(1, 1, H_p_pad, W_p_pad, device=device, dtype=dtype)
+        count_acc = torch.zeros(1, 1, H_p_pad, W_p_pad, device=device, dtype=dtype)
+
+        # Window top-left positions (pixel).
+        ys = list(range(0, max(1, H_pad - ws + 1), self.stride))
+        xs = list(range(0, max(1, W_pad - ws + 1), self.stride))
+        if ys[-1] != H_pad - ws:
+            ys.append(H_pad - ws)
+        if xs[-1] != W_pad - ws:
+            xs.append(W_pad - ws)
 
         for y in ys:
             for x in xs:
-                patch = image_hr[:, y:y+self.ws, x:x+self.ws].unsqueeze(0)  # (1,3,ws,ws)
-                # DINOv2 branch
+                patch = image_padded[:, y:y+ws, x:x+ws].unsqueeze(0)  # (1,3,ws,ws)
                 out = backbone(patch)
                 res = bank.predict(cls_name, out["patch"], out["cls"],
                                    return_map=True)
-                amap = res["anomaly_map"]  # (1, map_size, map_size)
-                # Convert amap back to patch-grid size: map_size is 448,
-                # each patch covers 14 pixels -> 32 patches
+                amap = res["anomaly_map"]  # (1, ws, ws)
+                # Downscale each window's anomaly map to patch-grid.
                 amap_p = F.interpolate(amap.unsqueeze(1), size=(win_p, win_p),
                                        mode="bilinear", align_corners=False)
-                # Clip weight
                 if clip_model is not None and clip_weight > 0 and clip_ref is not None:
                     c_in = F.interpolate(patch, size=(336, 336),
                                          mode="bilinear", align_corners=False)
@@ -104,14 +111,21 @@ class SlidingWindowInferer:
                                        mode="bilinear", align_corners=False)
                     amap_p = (1 - clip_weight) * amap_p + clip_weight * cm
 
-                # Splat into accumulators with Gaussian weights
-                yp = y // self.patch_stride
-                xp = x // self.patch_stride
-                score_acc[:, :, yp:yp+win_p, xp:xp+win_p] += amap_p * gw
-                count_acc[:, :, yp:yp+win_p, xp:xp+win_p] += gw
+                yp = y // ps
+                xp = x // ps
+                # Defensive: clip splat to accumulator bounds.
+                y_end = min(yp + win_p, H_p_pad)
+                x_end = min(xp + win_p, W_p_pad)
+                dy = y_end - yp
+                dx = x_end - xp
+                if dy > 0 and dx > 0:
+                    score_acc[:, :, yp:y_end, xp:x_end] += amap_p[:, :, :dy, :dx] * gw[:, :, :dy, :dx]
+                    count_acc[:, :, yp:y_end, xp:x_end] += gw[:, :, :dy, :dx]
 
         count_acc = count_acc.clamp_min(1e-6)
-        score_map_p = score_acc / count_acc  # (1,1,H_p,W_p)
-        score_map = F.interpolate(score_map_p, size=(H, W),
+        score_map_p = score_acc / count_acc
+        # Upsample from patch grid to full padded resolution, then crop.
+        score_map = F.interpolate(score_map_p, size=(H_pad, W_pad),
                                   mode="bilinear", align_corners=False)
+        score_map = score_map[:, :, :H, :W]
         return score_map[0, 0]

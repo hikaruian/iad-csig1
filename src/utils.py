@@ -5,13 +5,11 @@ Misc utilities: calibration, mask I/O, CSV I/O, percentile normalisation.
 from __future__ import annotations
 
 import csv
-import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 
@@ -20,34 +18,59 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 class PerClassPercentileCalibrator:
     """
-    Because anomaly scores from different classes live on different scales,
-    we calibrate image-level scores to a roughly [0,1] range using statistics
-    collected from the training set (normal-only). Specifically:
+    Per-class percentile calibration to a roughly [0, 1] range, using
+    statistics collected from (normal) training samples:
 
-        calibrated = (s - p50_train) / (p95_train - p50_train + eps)
-        then clamped to [0, 1] globally at submission time after mixing.
+        z = clamp((s - p50) / (p95 - p50 + eps), 0, 1)
+
+    Usage:
+        cal = PerClassPercentileCalibrator()
+        for batch in train_loader:
+            ...
+            cal.update(cls, scores)         # accumulate raw scores
+        cal.finalize()                      # compute percentiles once
+        z = cal.apply(cls, test_scores)     # map to [0,1]
+
+    We accumulate ALL scores (memory-light: 20 samples * 5 views = 100 floats
+    per class) and compute percentiles at finalize() time rather than
+    running-averaging them, because running averages of percentiles are
+    mathematically ill-defined and produce biased estimates.
     """
 
     def __init__(self, eps: float = 1e-6):
-        self.stats: Dict[str, Tuple[float, float]] = {}
         self.eps = eps
+        self._buf: Dict[str, List[float]] = {}
+        self.stats: Dict[str, Tuple[float, float]] = {}
 
-    @torch.no_grad()
-    def update(self, cls: str, scores: torch.Tensor):
-        s = scores.float().cpu().numpy().reshape(-1)
-        p50 = float(np.percentile(s, 50))
-        p95 = float(np.percentile(s, 95))
-        if cls in self.stats:
-            old_p50, old_p95 = self.stats[cls]
-            # running average (ok for our small dataset)
-            p50 = 0.5 * (old_p50 + p50)
-            p95 = 0.5 * (old_p95 + p95)
-        self.stats[cls] = (p50, p95)
+    def update(self, cls: str, scores):
+        """Accumulate raw scores (scalar or tensor/array) for a class."""
+        if isinstance(scores, torch.Tensor):
+            s = scores.detach().float().cpu().numpy().reshape(-1)
+        else:
+            s = np.asarray(scores, dtype=np.float32).reshape(-1)
+        self._buf.setdefault(cls, []).extend(s.tolist())
+
+    def finalize(self):
+        """Compute p50/p95 from accumulated scores. Called once after all
+        training samples have been passed to update()."""
+        for cls, vals in self._buf.items():
+            s = np.asarray(vals, dtype=np.float64)
+            p50 = float(np.percentile(s, 50))
+            p95 = float(np.percentile(s, 95))
+            # Guard against degenerate (all-identical) score distributions
+            if p95 - p50 < self.eps:
+                p95 = p50 + self.eps
+            self.stats[cls] = (p50, p95)
 
     def apply(self, cls: str, scores: torch.Tensor) -> torch.Tensor:
+        """Map raw scores to [0,1] using the stored p50/p95."""
+        if not self.stats:
+            # Auto-finalize if user forgot to call finalize()
+            self.finalize()
         if cls not in self.stats:
-            # unseen class: robust fallback
-            return torch.sigmoid(5.0 * (scores - scores.median()))
+            # Unseen class (zero-shot): robust fallback
+            med = torch.quantile(scores.reshape(-1).float(), 0.5)
+            return torch.sigmoid(5.0 * (scores - med)).clamp(0.0, 1.0)
         p50, p95 = self.stats[cls]
         z = (scores - p50) / (p95 - p50 + self.eps)
         return torch.clamp(z, 0.0, 1.0)
@@ -56,34 +79,55 @@ class PerClassPercentileCalibrator:
 # ---------------------------------------------------------------------------
 # Mask I/O (submission format: 448x448 single-channel 8-bit PNG)
 # ---------------------------------------------------------------------------
-def save_mask_png(mask: np.ndarray | torch.Tensor, path: str | Path,
-                  target_size: int = 448):
+def save_mask_png(mask, path, target_size: int = 448,
+                  global_lo: float = 0.0, global_hi: float = 1.0,
+                  gamma: float = 1.0):
     """
-    mask: (H, W) in arbitrary range. We normalise per-mask to [0,255] then
-          write as 8-bit PNG.
+    Save a single-channel anomaly mask as an 8-bit grayscale PNG at
+    (target_size, target_size).
+
+    IMPORTANT: we do NOT use per-mask min-max normalisation -- that destroys
+    cross-sample score comparability and kills the P-AUPR / PRO metrics.
+    Instead we clip to [global_lo, global_hi] (defaults [0,1] since the
+    calibrator already maps scores to [0,1]) and linearly scale to [0,255].
+    Optionally apply gamma correction (gamma < 1 boosts mid-range true
+    positives; gamma=0.6 is a well-known IAD sweet spot).
+
+    mask       : numpy array or torch tensor (H, W), values assumed in [0,1]
+                 after calibration; values outside are clipped.
+    path       : destination path
+    target_size: output PNG size
+    global_lo/global_hi: mapping window; values map lo->0, hi->255.
+    gamma      : optional gamma correction applied in [0,1] space.
     """
     if isinstance(mask, torch.Tensor):
-        mask = mask.float().detach().cpu().numpy()
+        mask = mask.detach().float().cpu().numpy()
     mask = np.asarray(mask, dtype=np.float32)
     if mask.ndim != 2:
         raise ValueError(f"mask must be 2D, got shape {mask.shape}")
-    if mask.shape != (target_size, target_size):
-        mask_pil = Image.fromarray(
-            (mask - mask.min()) / (mask.max() - mask.min() + 1e-8) * 255
-        ).convert("L")
-        mask_pil = mask_pil.resize((target_size, target_size), Image.BILINEAR)
-        mask = np.asarray(mask_pil, dtype=np.float32)
-    # Per-mask min-max to [0, 255] so each mask uses the full dynamic range
-    m_min, m_max = float(mask.min()), float(mask.max())
-    if m_max - m_min < 1e-8:
-        out = np.zeros_like(mask, dtype=np.uint8)
-    else:
-        out = ((mask - m_min) / (m_max - m_min) * 255.0).astype(np.uint8)
+
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    mask = np.clip(mask, 0.0, 1.0)
+
+    # Resize in FLOAT32 (bilinear) to avoid quantisation artefacts that
+    # arise when you quantise to uint8 *before* interpolating – the latter
+    # creates visible stairstepping at anomaly boundaries and kills PRO.
+    if mask.shape != (target_size, target_size):
+        mask_f = Image.fromarray(mask.astype(np.float32), mode="F")
+        mask_f = mask_f.resize((target_size, target_size), Image.BILINEAR)
+        mask = np.asarray(mask_f, dtype=np.float32)
+
+    # Global window linear map, no per-mask renormalisation.
+    z = (mask - global_lo) / (global_hi - global_lo + 1e-8)
+    z = np.clip(z, 0.0, 1.0)
+    if gamma != 1.0:
+        z = np.power(z, gamma)
+    out = np.clip(z * 255.0, 0, 255).astype(np.uint8)
     Image.fromarray(out, mode="L").save(str(path))
 
 
-def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path: str | Path):
+def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path):
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -106,7 +150,7 @@ def tta_flips(x: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
 
 
 def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:
-    """Reverse the flip applied to an anomaly map (shape B,H,W or B,1,H,W)."""
+    """Reverse the flip applied to an anomaly map (shape ...,H,W)."""
     if aug_name == "orig":
         return amap
     dims = []
@@ -121,10 +165,17 @@ def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:
 # Logging helper
 # ---------------------------------------------------------------------------
 class AverageMeter:
-    def __init__(self): self.reset()
-    def reset(self): self.v = 0.0; self.n = 0
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.v = 0.0
+        self.n = 0
+
     def update(self, x, n: int = 1):
-        self.v += float(x) * n; self.n += n
+        self.v += float(x) * n
+        self.n += n
+
     @property
     def avg(self):
         return self.v / max(1, self.n)

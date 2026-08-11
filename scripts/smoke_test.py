@@ -77,7 +77,18 @@ class TinyFakeBackbone(nn.Module):
                 p = out[:, 1:].reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2)
                 patch_layers.append(p)
         cls_tok = F.normalize(out[:, 0], dim=-1)
-        fused = F.normalize(torch.cat(patch_layers, dim=1), dim=1)
+        fused_cat = torch.cat(patch_layers, dim=1)   # (B, 4*D, Hp, Wp)
+        # Mimic DINOv2FeatureExtractor's fuse_proj: project multi-layer back to D
+        if not hasattr(self, "_fuse"):
+            n_layers = len(layers_to_get)
+            self._fuse = nn.Conv2d(n_layers * self.embed_dim, self.embed_dim, 1, bias=False)
+            nn.init.zeros_(self._fuse.weight)
+            with torch.no_grad():
+                for i in range(n_layers):
+                    self._fuse.weight[:, i*self.embed_dim:(i+1)*self.embed_dim, 0, 0] = \
+                        torch.eye(self.embed_dim) / n_layers
+            self._fuse.eval()
+        fused = F.normalize(self._fuse(fused_cat), dim=1)
         return {"cls": cls_tok, "patch": fused, "patch_layers": patch_layers,
                 "Hp": Hp, "Wp": Wp}
 
