@@ -218,6 +218,44 @@ class CSIGAnomalyPipeline:
         from contextlib import nullcontext
         return nullcontext()
 
+    def _prefetch_banks(self, mode: str):
+        """Bring coreset banks onto the GPU according to ``mode``.
+
+        mode:
+          "all"   : prefetch every class (fastest, uses ~3.2 GB).
+          "lazy"  : no prefetch; predict() migrates per-class.
+          "cls"   : lazy + explicit per-class eviction in this module.
+        Returns the resolved mode string.  On OOM falls back to "lazy".
+        """
+        if mode == "all" and self.device.type == "cuda":
+            try:
+                self.patchcore.banks_to_device(self.device)
+                return "all"
+            except torch.cuda.OutOfMemoryError:
+                self._empty_cache()
+                print("[pipeline] bank prefetch OOM -- falling back to lazy migration")
+                return "lazy"
+        return mode if mode in ("lazy", "cls") else "lazy"
+
+    def _ensure_bank_on_device(self, cls: str, banks_mode: str):
+        """Migrate a single class' bank to the active device when in lazy mode."""
+        if banks_mode == "all":
+            return
+        bk = self.patchcore.banks.get(cls, None)
+        if bk is not None and bk.features.device != self.device:
+            bk.features = bk.features.to(self.device, non_blocking=True)
+            bk.cls_prototype = bk.cls_prototype.to(self.device, non_blocking=True)
+
+    def _evict_bank_to_cpu(self, cls: str):
+        """Move a single class' bank + CLIP ref back to CPU to free GPU memory."""
+        bk = self.patchcore.banks.get(cls, None)
+        if bk is not None and bk.features.device.type != "cpu":
+            bk.features = bk.features.to("cpu", non_blocking=True)
+            bk.cls_prototype = bk.cls_prototype.to("cpu", non_blocking=True)
+        cr = self.clip_refs.get(cls, None)
+        if cr is not None and cr.device.type != "cpu":
+            self.clip_refs[cls] = cr.to("cpu", non_blocking=True)
+
     def _run_backbone(self, module, x, call: str = "__call__", **kwargs):
         if self.cfg.use_dp and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             from .dist_utils import auto_parallel_forward
@@ -407,33 +445,39 @@ class CSIGAnomalyPipeline:
         loader = DataLoader(ds, batch_size=1, shuffle=False,
                             num_workers=self.cfg.num_workers, pin_memory=True,
                             persistent_workers=(self.cfg.num_workers > 0))
-        # Collect per-class image scores AND per-class map pixel values so
-        # we can later normalise anomaly maps using TRAIN-SET statistics.
-        # IMPORTANT: we run the SAME scoring formula here as at inference
-        # (including TTA) so the percentiles reflect the actual test-time
-        # score distribution.
+        # IMPORTANT: we do NOT prefetch all banks here -- that was the cause of
+        # the fit/calibrate OOM (~3.2 GB for 50 classes x 16k x 1024 fp32).
+        # Instead we use LAZY per-class migration + immediate eviction, so only
+        # ONE class' coreset bank (~64 MB) is resident on GPU at any time.
+        banks_mode = "lazy"
+
         img_buf: Dict[str, List[float]] = {c: [] for c in self.classes}
         map_pix_buf: Dict[str, List[torch.Tensor]] = {c: [] for c in self.classes}
 
-        # Make sure banks are on GPU for calibration (same as predict path)
-        self.patchcore.banks_to_device(self.device)
+        prev_cls: Optional[str] = None
 
         for batch in tqdm(loader, desc="fit/calibrate"):
             views = self._move_input(batch["views"].squeeze(0))  # (V,3,H,W)
             cls = batch["cls_name"][0]
 
+            # Lazy-migrate the current class' bank to GPU; evict the previous.
+            if cls != prev_cls:
+                if prev_cls is not None:
+                    self._evict_bank_to_cpu(prev_cls)
+                self._ensure_bank_on_device(cls, banks_mode)
+                prev_cls = cls
+
             # Run the identical DINO (with TTA) pipeline used at inference
             img_raw, dino_map = self._dino_tta_forward(views, cls)
             img_buf[cls].append(float(img_raw.item()))
-            # Subsample map pixels (5 views × 448×448 ≈ 1M px; keep 5k per sample
-            # to keep CPU memory low — percentiles are stable with 100k pixels
-            # per class, not 200k, and this saves ~30 MB).
+            # Subsample map pixels to keep CPU memory low.
             flat = dino_map.detach().reshape(-1).cpu()
             idx = torch.randperm(flat.shape[0], generator=g_cal)[:5000]
             map_pix_buf[cls].append(flat[idx])
             del views, dino_map, flat
-        # Evict banks back to CPU to free GPU memory before prediction
-        self.patchcore.banks_to_cpu()
+        # Evict last class
+        if prev_cls is not None:
+            self._evict_bank_to_cpu(prev_cls)
         self._empty_cache()
 
         # Fit calibrator on image scores
@@ -558,25 +602,21 @@ class CSIGAnomalyPipeline:
                             num_workers=self.cfg.num_workers, pin_memory=True,
                             persistent_workers=(self.cfg.num_workers > 0))
 
-        # Banks-location policy:
-        #   banks_on_gpu=True  -> prefetch all banks (fastest, uses ~3.2 GB)
-        #   banks_on_gpu=False -> lazy per-class migration + eviction
-        #                         (safest for ≤12 GB cards; ~64 MB peak)
-        # We try the requested mode and OOM-fallback to lazy migration.
+        # Bank prefetch policy -- mirrors calibration:
+        #   banks_on_gpu=True  -> try prefetching all (~3.2 GB), fallback to lazy
+        #   banks_on_gpu=False -> lazy per-class migration + eviction (~64 MB peak)
         print(f"[predict] Running inference on {len(ds)} test samples ...")
-        banks_prefetched = False
         if self.cfg.banks_on_gpu:
-            try:
-                self.patchcore.banks_to_device(self.device)
-                banks_prefetched = True
-                print(f"[predict] Coreset banks prefetched to {self.device}")
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                print("[predict] Prefetch OOM -- falling back to lazy bank migration")
+            banks_mode = self._prefetch_banks("all")
+        else:
+            banks_mode = "lazy"
+        if banks_mode == "all":
+            print(f"[predict] Coreset banks prefetched to {self.device}")
         else:
             print("[predict] Lazy bank migration (banks_on_gpu=false) -- lowest VRAM")
         self._empty_cache()
 
+        prev_cls: Optional[str] = None
         rows: List[Tuple[str, float]] = []
         for batch in tqdm(loader, desc="predict"):
             views = self._move_input(batch["views"].squeeze(0))
@@ -584,10 +624,15 @@ class CSIGAnomalyPipeline:
             sample_id = batch["sample_id"][0]
             group_folder = batch["group_folder"][0]
 
+            # Lazy bank swap: evict previous class before loading the new one
+            if banks_mode != "all" and cls != prev_cls:
+                if prev_cls is not None:
+                    self._evict_bank_to_cpu(prev_cls)
+                self._ensure_bank_on_device(cls, banks_mode)
+                prev_cls = cls
+
             views_clip = None
             if self.clip is not None:
-                # _imagenet_to_clip will re-read cached stats on-device;
-                # we feed it fp16 input (or fp32 depending on AMP).
                 views_clip = _imagenet_to_clip(views)
 
             if cls in self.patchcore.banks:
@@ -604,22 +649,13 @@ class CSIGAnomalyPipeline:
                               target_size=self.cfg.input_size,
                               global_lo=0.0, global_hi=1.0)
 
-            # Per-sample cleanup: drop references + evict banks if lazy mode
+            # Per-sample cleanup
             del views, views_clip, masks
-            if not banks_prefetched:
-                # Evict this class' bank back to CPU after use so we only
-                # ever have one class coreset resident on GPU at a time.
-                bk = self.patchcore.banks.get(cls, None)
-                if bk is not None and bk.features.device.type != "cpu":
-                    bk.features = bk.features.to("cpu", non_blocking=True)
-                    bk.cls_prototype = bk.cls_prototype.to("cpu", non_blocking=True)
-                # Also evict CLIP ref to CPU for this class
-                cr = self.clip_refs.get(cls, None)
-                if cr is not None and cr.device.type != "cpu":
-                    self.clip_refs[cls] = cr.to("cpu", non_blocking=True)
             self._empty_cache()
 
-        # Evict banks back to CPU at the end.
+        # Evict last class + any remaining banks
+        if prev_cls is not None:
+            self._evict_bank_to_cpu(prev_cls)
         self.patchcore.banks_to_cpu()
         self._empty_cache()
 

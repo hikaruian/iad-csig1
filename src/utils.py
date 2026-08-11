@@ -139,14 +139,18 @@ def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path):
 # ---------------------------------------------------------------------------
 # TTA helpers
 # ---------------------------------------------------------------------------
-def tta_flips(x: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
-    """Return a list of (name, tensor) for the 4 flip augmentations."""
-    return [
-        ("orig", x),
-        ("h",    torch.flip(x, dims=[-1])),
-        ("v",    torch.flip(x, dims=[-2])),
-        ("hv",   torch.flip(x, dims=[-2, -1])),
-    ]
+def tta_flips(x: torch.Tensor):
+    """Yield (name, flipped_tensor) for the 4 flip augmentations.
+
+    Implemented as a generator so callers can process one augmentation at a
+    time without materialising all 4 copies of the tensor simultaneously.
+    This saves ~3×(V·3·H·W) elements of activation memory (~22 MB at 448px
+    fp32, more with larger inputs / fp32 maps).
+    """
+    yield ("orig", x)
+    yield ("h",    torch.flip(x, dims=[-1]))
+    yield ("v",    torch.flip(x, dims=[-2]))
+    yield ("hv",   torch.flip(x, dims=[-2, -1]))
 
 
 def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:
