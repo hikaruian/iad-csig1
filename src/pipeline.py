@@ -72,8 +72,8 @@ class PipelineConfig:
     ens_clip_weight: float = 0.25           # weight of WinCLIP branch
 
     # ---- misc ----
-    batch_size: int = 2                     # per-view batch (i.e. 4 samples)
-    num_workers: int = 4
+    batch_size: int = 1                     # per-view batch (i.e. 4 samples)
+    num_workers: int = 2
     device: str = "cuda"
     seed: int = 42
 
