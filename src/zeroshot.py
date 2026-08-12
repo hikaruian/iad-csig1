@@ -98,6 +98,10 @@ def winclip_score(clip_model, patch_feat: torch.Tensor,
         delta = _normalize(defc_text - norm_text, dim=-1)
         cache[class_name] = delta
     delta = cache[class_name].to(device)
+    # Align dtype with patch features (patch_feat is always upcast to fp32 by
+    # the caller; the cached text delta may be fp16 because CLIP runs in AMP).
+    if delta.dtype != patch_feat.dtype:
+        delta = delta.to(patch_feat.dtype)
 
     B, D, Hp, Wp = patch_feat.shape
     flat = patch_feat.permute(0, 2, 3, 1).reshape(-1, D)  # (B*N, D)
@@ -152,3 +156,4 @@ def build_winclip_reference(clip_model, patch_feat_all: torch.Tensor,
     idx = torch.randperm(n, generator=g)[:n_select]
     bank = _normalize(patch_feat_all[idx], dim=-1).contiguous()
     return bank.half() if bank.dtype != torch.float16 else bank
+
