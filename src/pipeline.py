@@ -357,7 +357,7 @@ class CSIGAnomalyPipeline:
         ds = CSIGImageDataset(train_root, transform=tfm, classes=self.classes)
         loader = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=False,
                             num_workers=self.cfg.num_workers, pin_memory=True,
-                            persistent_workers=(self.cfg.num_workers > 0))
+                            persistent_workers=False)
         print(f"[fit] Extracting DINOv2 features from {len(ds)} training images ...")
 
         clip_patch_accum: Dict[str, List[torch.Tensor]] = {}
@@ -387,7 +387,7 @@ class CSIGAnomalyPipeline:
             clip_bs = max(1, int(self.cfg.clip_batch_size))
             ld_c = DataLoader(ds_c, batch_size=clip_bs, shuffle=False,
                               num_workers=self.cfg.num_workers, pin_memory=True,
-                              persistent_workers=(self.cfg.num_workers > 0))
+                              persistent_workers=False)
             print("[fit] Building WinCLIP reference banks ...")
             for batch in tqdm(ld_c, desc="fit/clip"):
                 imgs = self._move_input(batch["image"])
@@ -415,28 +415,29 @@ class CSIGAnomalyPipeline:
             self._empty_cache()
 
         # ---- Phase 3: coreset subsampling.
-        # With the new GPU-accelerated batched FPS + native torch RP, building
-        # all 50 classes takes a few SECONDS on GPU vs minutes on CPU.
-        # GPU memory footprint during selection is bounded by
-        #   (M*K + M*b) in fp16 ~ (49k*256 + 49k*64)*2 bytes ~ 30 MB
-        # which is essentially free.
-        print("[fit] Building coreset memory banks ...")
+        print("[fit] Building coreset memory banks (batched FPS on GPU) ...",
+              flush=True)
         coreset_dev = "cuda" if (self.cfg.coreset_on_gpu and self.device.type == "cuda") else "cpu"
         try:
-            self.patchcore.build(device=coreset_dev, bank_device="cpu")
+            self.patchcore.build(device=coreset_dev, bank_device="cpu",
+                                 verbose=True, progress=True)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) or "out of memory" in str(e):
                 self._empty_cache()
-                print(f"[fit] coreset on {coreset_dev} failed with OOM, retrying on CPU ...")
-                self.patchcore.build(device="cpu", bank_device="cpu")
+                print(f"[fit] coreset on {coreset_dev} failed with OOM, retrying on CPU ...",
+                      flush=True)
+                self.patchcore.build(device="cpu", bank_device="cpu",
+                                     verbose=True, progress=True)
             else:
                 raise
         self._empty_cache()
 
         # ---- Phase 4: calibration (per-sample TTA loop) ----
-        print("[fit] Calibrating per-class score distributions on train ...")
+        print("[fit] Calibrating per-class score distributions on train "
+              "(TTA on 20 samples/class -- takes 1-3 min) ...", flush=True)
         self._calibrate_on_train(train_root, tfm)
         self._empty_cache()
+        print("[fit] Done. All per-class banks built and calibrated.", flush=True)
 
     @torch.inference_mode()
     def _calibrate_on_train(self, train_root: Path, tfm):
@@ -444,7 +445,7 @@ class CSIGAnomalyPipeline:
         ds = CSIGSampleDataset(train_root, transform=tfm, classes=self.classes)
         loader = DataLoader(ds, batch_size=1, shuffle=False,
                             num_workers=self.cfg.num_workers, pin_memory=True,
-                            persistent_workers=(self.cfg.num_workers > 0))
+                            persistent_workers=False)
         # IMPORTANT: we do NOT prefetch all banks here -- that was the cause of
         # the fit/calibrate OOM (~3.2 GB for 50 classes x 16k x 1024 fp32).
         # Instead we use LAZY per-class migration + immediate eviction, so only
@@ -600,7 +601,7 @@ class CSIGAnomalyPipeline:
         ds = CSIGSampleDataset(test_root, transform=tfm, classes=test_classes)
         loader = DataLoader(ds, batch_size=1, shuffle=False,
                             num_workers=self.cfg.num_workers, pin_memory=True,
-                            persistent_workers=(self.cfg.num_workers > 0))
+                            persistent_workers=False)
 
         # Bank prefetch policy -- mirrors calibration:
         #   banks_on_gpu=True  -> try prefetching all (~3.2 GB), fallback to lazy

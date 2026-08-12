@@ -344,53 +344,53 @@ class MultiClassPatchCore:
         self._raw_cls[cls].append(cls_cpu)
 
     def build(self, device: str | torch.device | None = None,
-              bank_device: str | torch.device | None = "cpu"):
+              bank_device: str | torch.device | None = "cpu",
+              verbose: bool = True,
+              progress: bool = True):
         """Finalize all per-class banks (coreset subsampling).
 
         Args:
             device: compute device used for coreset selection.
             bank_device: where to STORE the finalised bank tensors.
                 "cpu" (default, safest): banks live on CPU and are lazily
-                moved to the active GPU on each ``predict()`` call. Use
-                ``banks_to_device()`` / ``banks_to_cpu()`` to explicitly
-                prefetch / evict.
+                moved to the active GPU on each ``predict()`` call.
                 "cuda": ~3 GB for 50 classes × 16k × 1024-d fp32; gives a
                 small speedup if you have ≥24 GB GPU memory.
+            verbose: print per-class timing.
+            progress: show a tqdm bar across classes.
         """
-        # If no device specified and CUDA is available, use it for coreset
-        # selection (it's 10-100× faster than CPU).
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_dev = torch.device(device)
 
-        for cls, feats in self._raw_features.items():
+        cls_iter = self._raw_features.items()
+        if progress:
+            from tqdm import tqdm as _tqdm
+            cls_iter = _tqdm(cls_iter, total=len(self._raw_features),
+                             desc="fit/coreset", leave=False)
+
+        total_t0 = None
+        if compute_dev.type == "cuda":
+            torch.cuda.synchronize(compute_dev)
+            total_t0 = torch.cuda.Event(enable_timing=True)
+            total_t1 = torch.cuda.Event(enable_timing=True)
+            total_t0.record()
+
+        for cls, feats in cls_iter:
             all_feats = torch.cat(feats, dim=0)   # (N, D)
             all_cls = torch.cat(self._raw_cls[cls], dim=0)
             # Filter dead (zero-padding) patches
             all_feats = all_feats[all_feats.abs().sum(-1) > 0]
 
-            # Upcast to fp32 for coreset selection only if needed; the
-            # distance computation on fp16 is numerically stable enough
-            # for farthest-point sampling.
             n_select = min(
                 self.coreset_max,
                 max(1024, int(self.coreset_ratio * all_feats.shape[0])),
             )
-            t0 = torch.cuda.Event(enable_timing=True) if compute_dev.type == "cuda" else None
-            t1 = torch.cuda.Event(enable_timing=True) if compute_dev.type == "cuda" else None
-            if t0 is not None:
-                torch.cuda.synchronize(compute_dev)
-                t0.record()
             bank = greedy_coreset(all_feats, n_select=n_select,
                                   random_proj_dim=self.random_proj_dim,
                                   device=compute_dev,
                                   batch_size=self.coreset_batch,
                                   presample_ratio=self.coreset_presample_ratio)
-            if t1 is not None:
-                t1.record()
-                torch.cuda.synchronize(compute_dev)
-                print(f"[coreset] {cls}: {all_feats.shape[0]} -> {n_select} patches "
-                      f"in {t0.elapsed_time(t1)/1000:.2f}s")
             bank = F.normalize(bank.float(), dim=-1).contiguous()
             proto = F.normalize(all_cls.to(compute_dev).float().mean(0, keepdim=True),
                                 dim=-1).squeeze(0)
@@ -400,6 +400,19 @@ class MultiClassPatchCore:
                 Hp=self.Hp, Wp=self.Wp,
                 cls_prototype=proto.to(bank_device).contiguous(),
             )
+            # Release memory immediately
+            del all_feats, all_cls, bank, proto
+            if torch.cuda.is_available() and compute_dev.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if total_t0 is not None:
+            total_t1.record()
+            torch.cuda.synchronize(compute_dev)
+            if verbose:
+                print(f"[coreset] Built {len(self.banks)} class banks in "
+                      f"{total_t0.elapsed_time(total_t1)/1000:.2f}s total",
+                      flush=True)
+
         self._raw_features.clear()
         self._raw_cls.clear()
 
