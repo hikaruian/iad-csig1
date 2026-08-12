@@ -1,21 +1,21 @@
 # Default configuration for CSIG / Real-IAD Variety challenge
 # -------------------------------------------------------------
-# Reproduces the primary submission.
-# Tuned for a SINGLE 16 GB GPU (RTX 3090/4080/A100-16G).
-# If you have >=24 GB, use configs/champion.yaml instead.
-# If you have <=12 GB, use configs/lowmem.yaml.
+# PIXEL-AP OPTIMISED defaults (based on feedback: P-AP was 0.176 with the
+# over-smoothed settings).  Key changes vs the earlier default:
+#   * no 3x3 patch averaging (neighbourhood_size=1)
+#   * single nearest neighbour (n_neighbours=1) instead of k=5 mean
+#   * lighter Gaussian smoothing (kernel=7 sigma=2.5) to preserve sharp defects
+#   * CLIP does NOT contribute to the mask (only to image score) -- WinCLIP
+#     patch maps are too noisy for pixel localisation on this dataset
+#   * NO cross-view mask voting (5 views are not pixel-registered; median
+#     across views kills single-view defects)
+#   * map lo percentile = 0.50 (median) so background maps to ~0;
+#     hi percentile = 0.997 so strong anomalies saturate at 1 without
+#     stretching weak noise across [0,1]
+#   * gamma=2.0 on final masks to suppress mid-range false positives
 #
-# Memory budget breakdown (fp16 AMP, lazy banks, batched FPS):
-#   DINOv2-L weights       ~600 MB
-#   CLIP ViT-L/14 weights  ~800 MB
-#   Activations (micro=2)  ~1.5 GB peak
-#   Single-class coreset   ~64 MB
-#   Buffers / TTA / maps   ~200 MB
-#   ----------------------------
-#   TOTAL                  ~3.2 GB per GPU
-#
-# Expected runtime: ~3-5 minutes on 1x RTX 3090 at 448px with 50 classes
-# (coreset build was the former bottleneck; now ~5-10s on GPU via batched FPS).
+# Expected peak GPU memory: ~3.2 GB (same as before).
+# Expected runtime: ~3-5 minutes on 1x RTX 3090.
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
@@ -23,29 +23,30 @@ out_dir:    "submission"
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
-input_size: 448             # must be divisible by 14 (DINO patch size)
+input_size: 448
 
 use_clip: true
 clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
+clip_mask_ens: false       # CLIP only helps image-level score, NOT mask
 
-# --- PatchCore++ ---
+# --- PatchCore++ (sharp localisation settings) ---
 coreset_ratio: 0.02
 coreset_max: 16384
-neighbourhood_size: 3
-n_neighbours: 5
-smooth_kernel: 9
-smooth_sigma: 4.0
+neighbourhood_size: 1      # 1 = no 3x3 averaging (was 3, which smeared defects)
+n_neighbours: 1            # 1-NN (was 5, average distance dilutes peaks)
+smooth_kernel: 7
+smooth_sigma: 2.5         # light Gaussian (was 4.0, which over-smoothed)
 cls_bank_weight: 0.25
-# Coreset build speed knobs (see MEMORY_OPTIMIZATIONS.md for details):
-coreset_batch: 64           # points picked per FPS matmul; 64 = ~100x faster than naive
-coreset_presample_ratio: 3.0  # random pre-subsample multiplier before FPS
-random_proj_dim: 256        # sparse RP dimension for distance calculations
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
 
 # --- Multi-view ---
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
-use_mv_attn: false          # unused in default scoring; saves ~16 MB
+use_mv_attn: false
+mv_mask_vote: "none"       # was "median" which destroyed single-view defects
 
 # --- TTA ---
 use_tta: true
@@ -53,18 +54,26 @@ tta_weight_orig: 1.0
 tta_weight_flip: 0.5
 
 # --- Ensemble ---
-ens_dino_weight: 0.75
-ens_clip_weight: 0.25
+ens_dino_weight: 1.0       # mask comes from DINO only
+ens_clip_weight: 0.25      # CLIP still blends into image score in _predict_one_sample
+
+# --- Normalisation percentiles (calibrated for P-AP) ---
+dino_map_lo_q: 0.50        # median -> 0  (was 0.05, over-stretched background)
+dino_map_hi_q: 0.997       # 99.7% -> 1  (was 0.99)
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+# --- Post-processing ---
+mask_gamma: 2.0            # gamma > 1 crushes weak FP, preserves strong TP
 
 # --- Memory / precision ---
-batch_size: 2               # DINO train batch size
-clip_batch_size: 1          # CLIP forward micro-batch
-dino_view_micro: 2          # max views per DINO micro-batch at inference
-knn_chunk: 512              # query chunk for kNN matmul
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
 num_workers: 4
-use_amp: true               # fp16 autocast (~halves VRAM)
-banks_on_gpu: false         # lazy per-class bank migration (~64 MB vs ~3.2 GB)
-coreset_on_gpu: true        # run coreset selection on GPU (fast, ~30 MB temp)
-raw_store_fp16: true        # store raw train features in fp16 (halves CPU RAM)
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
 device: "cuda"
 seed: 42

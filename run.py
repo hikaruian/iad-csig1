@@ -24,7 +24,15 @@ from dataclasses import fields
 from pathlib import Path
 
 import yaml
-from src.pipeline import CSIGAnomalyPipeline, PipelineConfig
+
+# --- Clear stale bytecode caches so updated .py files are always picked up ---
+# (in long-running notebook/Kaggle sessions, Python may otherwise reuse old
+# .pyc files from __pycache__, causing dtype bugs like "expected mat1 and mat2
+# to have the same dtype" even after the source is fixed).
+for _p in Path(__file__).resolve().parent.rglob("__pycache__"):
+    shutil.rmtree(_p, ignore_errors=True)
+
+from src.pipeline import CSIGAnomalyPipeline, PipelineConfig  # noqa: E402
 
 
 def load_yaml_cfg(path: str | Path) -> dict:

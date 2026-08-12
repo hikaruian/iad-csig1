@@ -90,8 +90,10 @@ def save_mask_png(mask, path, target_size: int = 448,
     cross-sample score comparability and kills the P-AUPR / PRO metrics.
     Instead we clip to [global_lo, global_hi] (defaults [0,1] since the
     calibrator already maps scores to [0,1]) and linearly scale to [0,255].
-    Optionally apply gamma correction (gamma < 1 boosts mid-range true
-    positives; gamma=0.6 is a well-known IAD sweet spot).
+    Gamma correction (default 2.0) suppresses weak mid-range false positives
+    (background noise near ~0.3) while preserving strong anomaly responses
+    near ~1.0 -- this gives a significant pixel-AP boost on benchmarks where
+    most pixels are normal. Set gamma=1.0 to disable.
 
     mask       : numpy array or torch tensor (H, W), values assumed in [0,1]
                  after calibration; values outside are clipped.

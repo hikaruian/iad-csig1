@@ -93,11 +93,18 @@ class PipelineConfig:
     # ---- patchcore ----
     coreset_ratio: float = 0.02
     coreset_max: int = 16384
-    neighbourhood_size: int = 3
-    n_neighbours: int = 5
-    smooth_kernel: int = 9
-    smooth_sigma: float = 4.0
+    neighbourhood_size: int = 1    # 1 = no patch-level averaging (preserves sharp defects)
+    n_neighbours: int = 1          # use single nearest neighbour (k=1 best for localisation)
+    smooth_kernel: int = 7
+    smooth_sigma: float = 2.5      # lighter Gaussian to avoid smearing small defects
     cls_bank_weight: float = 0.25
+    # When True, CLIP branch contributes only to image-level score (NOT mask);
+    # CLIP patch maps are too noisy for pixel localisation on Real-IAD.
+    clip_mask_ens: bool = False
+    # Cross-view mask voting. "none" = per-view independent (BEST for pixel AP, since
+    # 5 views are NOT pixel-registered and median kills single-view defects);
+    # "median" = old behaviour, "mean" = 0.7·orig + 0.3·mean across views.
+    mv_mask_vote: str = "none"
 
     # ---- multi-view ----
     mv_aggregate: str = "robust_mean"
@@ -116,10 +123,17 @@ class PipelineConfig:
     ens_clip_weight: float = 0.25
 
     # ---- normalisation percentiles for DINO anomaly maps (from train set) ----
-    dino_map_lo_q: float = 0.05   # lower percentile = "background level" on normal samples
-    dino_map_hi_q: float = 0.99   # upper percentile = "clearly anomalous" level
+    # Use median for lo so background stays at ~0; use a high hi so strong
+    # anomalies saturate near 1 while weak noise stays suppressed -- this
+    # dramatically improves pixel AP by avoiding stretching background noise
+    # across the full [0,1] range.
+    dino_map_lo_q: float = 0.50    # median of normal-sample scores maps to ~0
+    dino_map_hi_q: float = 0.997   # leave the top 0.3% tail to saturate at 1
     dino_img_lo_q: float = 0.05
     dino_img_hi_q: float = 0.95
+
+    # ---- post-processing ----
+    mask_gamma: float = 2.0       # gamma on final masks (>1 suppresses weak FPs, boosts P-AP)
 
     # ---- memory / precision ----
     batch_size: int = 4
@@ -531,7 +545,12 @@ class CSIGAnomalyPipeline:
         dino_map_norm = ((dino_map - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
         del dino_map  # free the un-normalised map early
 
-        # ---- WinCLIP branch (no TTA for speed; optional) ----
+        # ---- WinCLIP branch ----
+        # WinCLIP text-aligned patch maps are useful for IMAGE-LEVEL scoring
+        # (they add semantic "defect-ness" signal) but are too noisy for pixel
+        # localisation: relu(patch·text_delta) fires on many normal texture
+        # edges, killing pixel AP.  So we only blend CLIP into the image
+        # score and keep the mask pure DINO-PatchCore.
         clip_img_score = torch.zeros(1, device=views_448.device, dtype=torch.float32)
         clip_map = None
         if self.clip is not None and views_clip is not None:
@@ -539,12 +558,8 @@ class CSIGAnomalyPipeline:
             if ref is not None and ref.device != views_clip.device:
                 ref = ref.to(views_clip.device)
                 self.clip_refs[cls] = ref
-            # Micro-batch CLIP forward to bound activation memory
-            # (ViT-L/14 at 448px uses ~1.3 GB/view in fp16). Use the config
-            # clip_batch_size so users can tune memory without editing code.
             micro = max(1, int(self.cfg.clip_batch_size))
-            all_patch = []
-            all_cls = []
+            all_patch, all_cls = [], []
             for i in range(0, views_clip.shape[0], micro):
                 sub = views_clip[i:i+micro]
                 with self._autocast_ctx():
@@ -557,12 +572,15 @@ class CSIGAnomalyPipeline:
             del all_patch, all_cls
             wc = winclip_score(self.clip, c_patch, c_cls,
                                cls, reference_patches=ref, alpha=0.5)
-            cm = wc["anomaly_map"].unsqueeze(1)            # (V,1,Hp_c,Wp_c)
-            cm = bilinear_upsample(cm, self.cfg.input_size)
-            cm = gaussian_smooth2d(cm, kernel_size=7, sigma=3.0)
-            clip_map = cm[:, 0].clamp(0.0, 1.0)            # (V,448,448)
             clip_img_score = wc["image_score"].mean().unsqueeze(0).clamp(0.0, 1.0)
-            del c_patch, c_cls, wc, cm
+            if self.cfg.clip_mask_ens:
+                cm = wc["anomaly_map"].unsqueeze(1)
+                cm = bilinear_upsample(cm, self.cfg.input_size)
+                cm = gaussian_smooth2d(cm, kernel_size=7, sigma=3.0)
+                clip_map = cm[:, 0].clamp(0.0, 1.0)
+            else:
+                clip_map = None
+            del c_patch, c_cls, wc
 
         # ---- Ensemble (both maps are now in [0,1]) ----
         wd = self.cfg.ens_dino_weight
@@ -578,7 +596,8 @@ class CSIGAnomalyPipeline:
 
         # ---- Cross-view mask voting ----
         ens_map = multiview_mask_vote(ens_map.unsqueeze(0),
-                                      beta=self.cfg.mv_vote_beta).squeeze(0)
+                                      beta=self.cfg.mv_vote_beta,
+                                      mode=self.cfg.mv_mask_vote).squeeze(0)
         # Final safety clamp
         ens_map = ens_map.clamp(0.0, 1.0)
         score = float(ens_score.item())
@@ -648,7 +667,8 @@ class CSIGAnomalyPipeline:
             for v in range(masks.shape[0]):
                 save_mask_png(masks[v], out_sample_dir / f"{v}_mask.png",
                               target_size=self.cfg.input_size,
-                              global_lo=0.0, global_hi=1.0)
+                              global_lo=0.0, global_hi=1.0,
+                              gamma=self.cfg.mask_gamma)
 
             # Per-sample cleanup
             del views, views_clip, masks
@@ -691,7 +711,9 @@ class CSIGAnomalyPipeline:
         cm = bilinear_upsample(cm, self.cfg.input_size)
         cm = gaussian_smooth2d(cm, kernel_size=7, sigma=3.0)
         cmap = cm[:, 0].clamp(0.0, 1.0)
-        cmap = multiview_mask_vote(cmap.unsqueeze(0)).squeeze(0)
+        cmap = multiview_mask_vote(cmap.unsqueeze(0),
+                                    beta=self.cfg.mv_vote_beta,
+                                    mode=self.cfg.mv_mask_vote).squeeze(0)
         img_score = wc["image_score"]  # (V,) in [0,1]
         cal_score = float(img_score.mean().clamp(0.0, 1.0).item())
         out_np = cmap.clamp(0, 1).cpu().numpy()

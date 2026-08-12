@@ -83,25 +83,30 @@ def winclip_score(clip_model, patch_feat: torch.Tensor,
         anomaly_map (B, Hp, Wp)
     """
     device = patch_feat.device
+    # Canonical compute dtype: we do all WinCLIP math in fp32 for numerical
+    # stability and to avoid any fp16/fp32 mismatch from AMP/half models.
+    work_dtype = torch.float32
+    patch_feat = patch_feat.to(dtype=work_dtype)
+    cls_feat = cls_feat.to(dtype=work_dtype)
 
     # --- Text embedding cache (per-class, computed once per process) ----
-    # encode_text() is cheap but not free; with 50 classes × 750 samples
-    # recomputing every forward pass wastes ~30s per run.
+    # NOTE: text embeddings are computed + cached in fp32 to avoid fp16/fp32
+    # mismatch with the (fp32) patch features downstream.
     cache = getattr(winclip_score, "_text_cache", None)
     if cache is None:
         cache = {}
         winclip_score._text_cache = cache
     if class_name not in cache:
-        norm_prompts, defc_prompts = build_text_prompts(class_name)
-        norm_text = _normalize(clip_model.encode_text(norm_prompts).mean(0), dim=-1)
-        defc_text = _normalize(clip_model.encode_text(defc_prompts).mean(0), dim=-1)
-        delta = _normalize(defc_text - norm_text, dim=-1)
-        cache[class_name] = delta
-    delta = cache[class_name].to(device)
-    # Align dtype with patch features (patch_feat is always upcast to fp32 by
-    # the caller; the cached text delta may be fp16 because CLIP runs in AMP).
-    if delta.dtype != patch_feat.dtype:
-        delta = delta.to(patch_feat.dtype)
+        with torch.no_grad():
+            norm_prompts, defc_prompts = build_text_prompts(class_name)
+            # .float() here is essential -- CLIP may be in fp16 (AMP) and we
+            # must NOT cache fp16 text vectors, otherwise the matmul with
+            # fp32 patches fails with "expected same dtype".
+            norm_text = _normalize(clip_model.encode_text(norm_prompts).float().mean(0), dim=-1)
+            defc_text = _normalize(clip_model.encode_text(defc_prompts).float().mean(0), dim=-1)
+            delta = _normalize((defc_text - norm_text).float(), dim=-1)
+        cache[class_name] = delta.detach().cpu()
+    delta = cache[class_name].to(device=device, dtype=work_dtype)
 
     B, D, Hp, Wp = patch_feat.shape
     flat = patch_feat.permute(0, 2, 3, 1).reshape(-1, D)  # (B*N, D)
@@ -156,4 +161,3 @@ def build_winclip_reference(clip_model, patch_feat_all: torch.Tensor,
     idx = torch.randperm(n, generator=g)[:n_select]
     bank = _normalize(patch_feat_all[idx], dim=-1).contiguous()
     return bank.half() if bank.dtype != torch.float16 else bank
-

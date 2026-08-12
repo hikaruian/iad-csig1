@@ -86,30 +86,30 @@ class CrossViewAttention(nn.Module):
 
 
 def multiview_mask_vote(per_view_maps: torch.Tensor,
-                        beta: float = 1.5) -> torch.Tensor:
+                        beta: float = 1.5,
+                        mode: str = "none") -> torch.Tensor:
     """
     Cross-view consensus blending for high-res anomaly maps.
 
-    per_view_maps : (B, V, H, W) per-view anomaly maps, values >= 0.
-    beta          : kept for API backward compatibility; unused.
-
+    per_view_maps : (B, V, H, W) per-view anomaly maps, values in [0,1].
+    mode :
+      - "none"   : return maps AS-IS (BEST for Real-IAD Variety, because the
+                   5 camera views show DIFFERENT physical surfaces — per-pixel
+                   median/mean destroys single-view defects and boosts
+                   background noise that coincidentally fires in 2+ views).
+      - "median" : 0.85*orig + 0.15*median across views.
+      - "mean"   : 0.85*orig + 0.15*mean across views.
     Returns (B, V, H, W) refined per-view maps.
-
-    Design rationale (after fixing two earlier broken attempts):
-      * We do NOT use per-sample percentiles or sigmoid gates that require
-        an "on/off" threshold — on normal images every pixel is nominally
-        "off", so any adaptive threshold that picks the per-sample median
-        as τ will flag HALF the pixels as "on" and amplify pure noise.
-      * We use the CROSS-VIEW MEDIAN as consensus. Median is robust to
-        single-view outliers (specular highlights, background clutter)
-        while still reinforcing true defects that appear in 2+ views.
-      * Refined map = 0.7*original + 0.3*consensus. This shrinks isolated
-        single-view spikes toward the consensus while preserving strong
-        responses that have cross-view support.
     """
-    consensus = per_view_maps.median(dim=1, keepdim=True).values  # (B,1,H,W)
-    refined = 0.7 * per_view_maps + 0.3 * consensus
-    return refined
+    if mode == "none":
+        return per_view_maps
+    if mode == "median":
+        consensus = per_view_maps.median(dim=1, keepdim=True).values
+        return 0.85 * per_view_maps + 0.15 * consensus
+    if mode == "mean":
+        consensus = per_view_maps.mean(dim=1, keepdim=True)
+        return 0.85 * per_view_maps + 0.15 * consensus
+    raise ValueError(f"Unknown mv_mask_vote mode: {mode}")
 
 
 def aggregate_image_scores(per_view_scores: torch.Tensor,
