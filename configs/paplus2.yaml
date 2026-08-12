@@ -1,0 +1,97 @@
+# paplus2.yaml -- second-round P-AP optimised config for Real-IAD Variety
+# =======================================================================
+# Improvements over paplus.yaml (P-AP 0.296, score 65.58):
+#   1. DINOv2 last-block CLS-attention FOREGROUND MASK (free signal),
+#      suppresses background / jig / conveyor-belt false positives.
+#   2. HARD-NEGATIVE normal mining: after FPS coreset, append the 2048
+#      highest-self-distance normal patches back to the bank (textured
+#      edges / engravings / screws / highlights that look anomalous to
+#      1-NN).
+#   3. Per-view connected-component size suppression: tiny components
+#      (<25 px @448) get multiplied by 0.1 (kills salt-and-pepper FPs).
+#   4. Raised dino_map_lo_q (0.50 -> 0.70) so background maps closer to 0;
+#      higher hi_q (0.997 -> 0.998) to preserve strong anomalies.
+#   5. Smaller gamma (2.5 -> 2.0) so mid-strength true defects are not
+#      over-crushed (now that background is already suppressed by fg mask).
+#   6. Smaller/lighter Gaussian (kernel=5 sigma=1.5) for sharper boundaries.
+#   7. Lower CLIP image-score weight (0.25 -> 0.20) because WinCLIP fires
+#      on many normal textures and slightly dilutes P-AP.
+#   8. Larger coreset (24576 -> 28672) to pack more boundary coverage.
+#
+# Expected: P-AP ~0.34-0.42, P-F1max ~0.45-0.52, total score ~68-72.
+# Peak GPU memory: ~4.0 GB per GPU (still fits 2x16GB Kaggle).
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus2"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+# --- PatchCore++ ---------------------------------------------------------
+coreset_ratio: 0.03
+coreset_max: 28672          # was 24576; +4k for better boundary coverage
+neighbourhood_size: 1       # no 3x3 avg (preserves sharp peaks)
+n_neighbours: 1             # 1-NN (best for localisation)
+smooth_kernel: 5
+smooth_sigma: 1.5           # even lighter smoothing for sharper defect edges
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+# --- Hard-negative mining ------------------------------------------------
+hard_negative_k: 2048       # append 2k "hard normal" patches per class
+
+# --- Foreground (DINOv2 last-block CLS attention) ------------------------
+use_foreground_mask: true
+fg_percentile: 35.0         # background = lowest 35% attention mass
+fg_bg_floor: 0.12           # background pixels multiplied by 0.12 (heavy suppression)
+fg_smooth_sigma: 2.0
+
+# --- Connected-component cleanup ----------------------------------------
+cc_min_area: 25             # components <25px @448 get multiplied by
+cc_threshold: 0.30
+cc_kill_factor: 0.10
+
+# --- Multi-view ----------------------------------------------------------
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+# --- TTA -----------------------------------------------------------------
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+# --- Ensemble ------------------------------------------------------------
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20       # slightly lower CLIP weight (0.25 -> 0.20)
+
+# --- Calibration percentiles --------------------------------------------
+dino_map_lo_q: 0.70         # was 0.50; background lo→p70 so less gray fog
+dino_map_hi_q: 0.998        # was 0.997; slightly more headroom for strong anomalies
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+# --- Final mask gamma ----------------------------------------------------
+mask_gamma: 2.0             # was 2.5; less crush now that fg mask kills background
+
+# --- Runtime / memory ----------------------------------------------------
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

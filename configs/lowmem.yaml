@@ -3,6 +3,9 @@
 # -------------------------------------------------------------
 # Expected peak GPU memory: ~2.2-2.5 GB with CLIP, ~1.4 GB without.
 # Runtime is ~15-20% slower than default due to smaller micro-batches.
+#
+# Note: this preset trades off some P-AP (uses neighbourhood_size=3, n_neighbours=5,
+# heavier smoothing) to fit in small VRAM. For best P-AP use default/paplus2.
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
@@ -11,6 +14,7 @@ input_size: 392             # 392/14=28 (smaller grid -> lower activation memory
 use_clip: true
 clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
+clip_mask_ens: false
 
 coreset_ratio: 0.01
 coreset_max: 8192
@@ -23,16 +27,33 @@ coreset_batch: 64
 coreset_presample_ratio: 3.0
 random_proj_dim: 256
 
+# Memory savers: disable hard-negative mining (avoids the extra training-pass)
+hard_negative_k: 0
+use_foreground_mask: true   # foreground is cheap; keep it
+fg_percentile: 35.0
+fg_bg_floor: 0.15
+fg_smooth_sigma: 2.0
+cc_min_area: 20
+cc_threshold: 0.35
+cc_kill_factor: 0.10
+
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
 use_mv_attn: false
+mv_mask_vote: "none"
 
 use_tta: true
 tta_weight_orig: 1.0
 tta_weight_flip: 0.5
 
-ens_dino_weight: 0.75
-ens_clip_weight: 0.25
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20
+
+dino_map_lo_q: 0.65
+dino_map_hi_q: 0.995
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+mask_gamma: 2.0
 
 batch_size: 1
 clip_batch_size: 1
@@ -42,6 +63,5 @@ num_workers: 2
 use_amp: true
 banks_on_gpu: false
 coreset_on_gpu: true
-raw_store_fp16: true
 device: "cuda"
 seed: 42

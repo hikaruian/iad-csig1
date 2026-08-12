@@ -105,11 +105,16 @@ class DINOv2FeatureExtractor(nn.Module):
         return self.extract_features(x)
 
     @torch.no_grad()
-    def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def extract_features(self, x: torch.Tensor, return_last_attn: bool = False
+                         ) -> Dict[str, torch.Tensor]:
         """
         Parameters
         ----------
         x : (B, 3, H, W)
+        return_last_attn : if True, also returns ``"last_attn"`` -- the
+            CLS→patch attention weights from the FINAL transformer block,
+            useful as a free class-agnostic foreground/saliency map (see
+            Caron et al. DINO self-segmentation; costs no extra forward).
 
         Returns
         -------
@@ -117,6 +122,7 @@ class DINOv2FeatureExtractor(nn.Module):
             "cls"    : (B, D)           – <[BOS_never_used_51bce0c785ca2f68081bfa7d91973934]> token from the LAST block.
             "patch"  : (B, D, Hp, Wp)   – FUSED multi-layer patch features.
             "patch_layers": list[(B, D, Hp, Wp)] – per-layer patch features.
+            "last_attn": (B, Hp, Wp) [optional, if return_last_attn]
         """
         B, _, H, W = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0, \
@@ -137,8 +143,47 @@ class DINOv2FeatureExtractor(nn.Module):
 
         patch_layers: List[torch.Tensor] = []
         cls_token = None
+        last_attn = None
+
+        # If the caller wants last-block attention, install a temporary
+        # forward hook on the LAST block's attn.qkv / attn.proj module.
+        # DINOv2 blocks use ``x = x + self.attn(self.norm1(x))`` where
+        # self.attn returns the post-proj attention output; attention
+        # weights are NOT exposed by default. Instead we re-run the final
+        # block's attention manually to read the CLS→patch weights.
+        last_block = self.model.blocks[-1]
+
         for i, blk in enumerate(self.model.blocks):
-            x = blk(x)
+            if return_last_attn and i == self.num_layers - 1:
+                # Manual attention extraction for the final block. We use a
+                # try/except because DINOv2's attention implementation varies
+                # across versions (some use fused SDPA, extra norms, etc.).
+                # If extraction fails we silently skip -- downstream falls
+                # back to no-foreground mask.
+                try:
+                    B_i, N, D_i = x.shape
+                    nx = blk.norm1(x)
+                    attn_mod = blk.attn
+                    num_heads = getattr(attn_mod, "num_heads", None) or getattr(attn_mod, "num_heads", None)
+                    if num_heads is not None and hasattr(attn_mod, "qkv"):
+                        head_dim = D_i // num_heads
+                        qkv = attn_mod.qkv(nx).reshape(B_i, N, 3, num_heads, head_dim)
+                        qkv = qkv.permute(2, 0, 3, 1, 4)
+                        q, k, _v = qkv.unbind(0)  # (B, heads, N, head_dim)
+                        scale = getattr(attn_mod, "scale", head_dim ** -0.5)
+                        aw = (q @ k.transpose(-2, -1)) * scale
+                        aw = aw.softmax(dim=-1)
+                        # CLS row -> patch columns, average over heads
+                        cls_attn = aw[:, :, 0, patch_start:].mean(dim=1)  # (B, Hp*Wp)
+                        last_attn = cls_attn.reshape(B, Hp, Wp)
+                        del qkv, q, k, _v, aw, cls_attn
+                except Exception:
+                    last_attn = None
+                # Run the block normally regardless
+                x = blk(x)
+            else:
+                x = blk(x)
+
             if i in self.layers:
                 # tokens[:, patch_start:] are spatial patches only
                 tokens = x  # (B, 1+reg+Hp*Wp, D)
@@ -164,6 +209,7 @@ class DINOv2FeatureExtractor(nn.Module):
             "patch": fused,
             "patch_layers": patch_layers,
             "Hp": Hp, "Wp": Wp,
+            **({"last_attn": last_attn} if last_attn is not None else {}),
         }
 
 

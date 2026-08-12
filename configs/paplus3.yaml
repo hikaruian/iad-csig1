@@ -1,15 +1,14 @@
-# Champion config (v2) -- best P-AP tuned for 16 GB+ GPUs (Kaggle 2x16GB).
-# ===========================================================================
-# This is the config that should win the competition. It layers every P-AP
-# trick from paplus2/paplus3 on top of a larger bank, while staying within
-# the Kaggle 2x16 GB VRAM budget (banks_on_gpu=false lazy swap; ~4 GB/run).
-#
-# Expected: I-AUROC >= 0.89, P-AP >= 0.38, total score ~72-76.
-# If P-AP still plateaus <0.35, try paplus3.yaml (more aggressive).
+# paplus3.yaml -- aggressive P-AP config (try if paplus2 P-AP plateaus).
+# =======================================================================
+# Trade-offs: slightly more aggressive background suppression, larger
+# coreset bank, zero CLIP contribution (pure DINO-kNN for localisation),
+# more hard negatives, stronger CC cleanup, higher gamma.
+# If P-AP is still <0.35 on paplus2, try this. If P-AUROC drops >0.02
+# revert to paplus2.
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
-out_dir:    "submission_champion"
+out_dir:    "submission_paplus3"
 
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]
@@ -22,29 +21,29 @@ clip_mask_ens: false
 
 # --- PatchCore++ ---------------------------------------------------------
 coreset_ratio: 0.04
-coreset_max: 32768           # large bank for best coverage
+coreset_max: 32768
 neighbourhood_size: 1
 n_neighbours: 1
 smooth_kernel: 5
-smooth_sigma: 1.5
+smooth_sigma: 1.2           # very sharp: minimal Gaussian for tiny-defect localisation
 cls_bank_weight: 0.15
 coreset_batch: 64
 coreset_presample_ratio: 3.0
-random_proj_dim: 256
+random_proj_dim: 384        # larger RP -> less distance distortion (cost ~50% more coreset time)
 
 # --- Hard-negative mining ------------------------------------------------
-hard_negative_k: 3072
+hard_negative_k: 4096       # many hard normals (requires coreset_max large enough)
 
 # --- Foreground ----------------------------------------------------------
 use_foreground_mask: true
-fg_percentile: 35.0
-fg_bg_floor: 0.12
-fg_smooth_sigma: 2.0
+fg_percentile: 40.0         # more aggressive (more area considered "background")
+fg_bg_floor: 0.10           # harder background suppression
+fg_smooth_sigma: 2.5
 
 # --- Connected-component cleanup ----------------------------------------
-cc_min_area: 25
-cc_threshold: 0.30
-cc_kill_factor: 0.10
+cc_min_area: 40             # larger min area -> fewer FPs, may lose tiny defects
+cc_threshold: 0.25
+cc_kill_factor: 0.05
 
 # --- Multi-view ----------------------------------------------------------
 mv_aggregate: "robust_mean"
@@ -59,25 +58,25 @@ tta_weight_flip: 0.5
 
 # --- Ensemble ------------------------------------------------------------
 ens_dino_weight: 1.0
-ens_clip_weight: 0.20
+ens_clip_weight: 0.15       # minimal CLIP (image score only, weight down)
 
 # --- Calibration percentiles --------------------------------------------
-dino_map_lo_q: 0.70
-dino_map_hi_q: 0.998
+dino_map_lo_q: 0.75         # even higher floor -> less gray fog
+dino_map_hi_q: 0.999        # preserve extreme tail
 dino_img_lo_q: 0.05
 dino_img_hi_q: 0.95
 
 # --- Final mask gamma ----------------------------------------------------
-mask_gamma: 2.0
+mask_gamma: 2.2             # slightly more aggressive FP crushing
 
 # --- Runtime / memory ----------------------------------------------------
 batch_size: 2
 clip_batch_size: 1
-dino_view_micro: 2
+dino_view_micro: 1          # micro-batch 1 for extra safety with larger bank
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: false          # lazy swap per class (safer on 16 GB)
+banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42

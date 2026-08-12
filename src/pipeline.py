@@ -24,6 +24,8 @@ from .backbones import CLIPFeatureExtractor, DINOv2FeatureExtractor
 from .dataset import (CSIGImageDataset, CSIGSampleDataset, build_test_transform,
                       build_train_transform, discover_classes,
                       IMAGENET_MEAN, IMAGENET_STD, CLIP_MEAN, CLIP_STD)
+from .foreground import (apply_foreground, foreground_from_last_attn,
+                         remove_small_components_torch)
 from .multiview import (CrossViewAttention, aggregate_image_scores,
                         multiview_mask_vote)
 from .patchcore import MultiClassPatchCore, bilinear_upsample, gaussian_smooth2d
@@ -131,6 +133,20 @@ class PipelineConfig:
     dino_map_hi_q: float = 0.997   # leave the top 0.3% tail to saturate at 1
     dino_img_lo_q: float = 0.05
     dino_img_hi_q: float = 0.95
+
+    # ---- foreground mask (DINOv2 last-block CLS attention) ----
+    use_foreground_mask: bool = True
+    fg_percentile: float = 35.0   # percentile threshold for foreground (lower = more aggressive)
+    fg_bg_floor: float = 0.15     # background multiplier floor (lower = more suppression)
+    fg_smooth_sigma: float = 2.0
+
+    # ---- hard-negative mining (add high-distance normal patches to bank) ----
+    hard_negative_k: int = 2048   # extra normal patches to append per class; 0 disables
+
+    # ---- connected-component suppression ----
+    cc_min_area: int = 25         # components smaller than this (at 448x448) get suppressed
+    cc_threshold: float = 0.30    # binarisation threshold for CC detection
+    cc_kill_factor: float = 0.1   # tiny components multiplied by this factor
 
     # ---- post-processing ----
     mask_gamma: float = 2.0       # gamma on final masks (>1 suppresses weak FPs, boosts P-AP)
@@ -294,48 +310,71 @@ class CSIGAnomalyPipeline:
             return x.to(self.device, dtype=torch.float16, non_blocking=True)
         return x.to(self.device, non_blocking=True)
 
-    def _dino_backbone_micro(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _dino_backbone_micro(self, x: torch.Tensor, return_attn: bool = False
+                             ) -> Dict[str, torch.Tensor]:
         """Run DINOv2 backbone in micro-batches of views to cap activation
         memory. Each micro-batch is concatenated back, matching the output
         shape of a single big forward (B=V)."""
         micro = max(1, int(self.cfg.dino_view_micro))
-        if x.shape[0] <= micro:
-            out = self._run_backbone(self.dino, x)
-            return {"patch": out["patch"].float(),
-                    "cls": out["cls"].float()}
-        patches, clses = [], []
+        # The DINOv2 extractor supports return_last_attn=True; propagate.
+        # We use direct module call (not _run_backbone's DP wrapper) because
+        # DP won't pass through extra kwargs cleanly when use_dp is on --
+        # but use_dp default is False and the kaggle setup doesn't use it.
+        patches, clses, attns = [], [], []
         for i in range(0, x.shape[0], micro):
             sub = x[i:i+micro]
-            o = self._run_backbone(self.dino, sub)
+            if self.cfg.use_dp and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                # DP path: fall back to running without attention extraction
+                from .dist_utils import auto_parallel_forward
+                with self._autocast_ctx():
+                    o = auto_parallel_forward(self.dino, sub)
+            else:
+                with self._autocast_ctx():
+                    o = self.dino.extract_features(sub, return_last_attn=return_attn)
             patches.append(o["patch"].float())
             clses.append(o["cls"].float())
+            if return_attn and "last_attn" in o:
+                attns.append(o["last_attn"].float())
             del sub, o
-        return {"patch": torch.cat(patches, dim=0),
-                "cls": torch.cat(clses, dim=0)}
+        out = {"patch": torch.cat(patches, dim=0),
+               "cls": torch.cat(clses, dim=0)}
+        if return_attn and attns:
+            out["last_attn"] = torch.cat(attns, dim=0)
+        return out
 
     def _dino_forward(self, x: torch.Tensor, cls: str,
-                      return_map: bool = True) -> Dict[str, torch.Tensor]:
+                      return_map: bool = True,
+                      return_fg: bool = False
+                      ) -> Dict[str, torch.Tensor]:
         """Run DINOv2 + PatchCore and return per-view image scores and
         (optionally) per-view high-res anomaly maps. Shared by training
         calibration and inference so the two paths are NUMERICALLY IDENTICAL
         (modulo TTA at inference time)."""
-        out = self._dino_backbone_micro(x)
+        out = self._dino_backbone_micro(x, return_attn=return_fg)
         # Outputs are already fp32; upcast was done in _dino_backbone_micro.
         res = self.patchcore.predict(cls, out["patch"], out["cls"],
                                      return_map=return_map)
+        if return_fg and "last_attn" in out:
+            res["last_attn"] = out["last_attn"]
         return res
 
-    def _dino_tta_forward(self, views: torch.Tensor, cls: str
+    def _dino_tta_forward(self, views: torch.Tensor, cls: str,
+                          apply_fg: bool = False
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run DINO branch with flip TTA, returning (dino_img_raw, dino_map)
         where dino_img_raw is (1,) sample-level raw score (pre-calibration)
         and dino_map is (V, H, W) fused per-view high-res map.
 
-        Memory note: views is (V,3,H,W). We flip views on-device (views are
-        already on GPU) and run DINO in micro-batches, keeping only one
-        augmentation's anomaly map resident at a time; the weighted sum
-        is accumulated in-place to avoid materialising a (4, V, H, W)
-        tensor (~22 MB at 448 fp32 — not huge but worth avoiding).
+        When ``apply_fg`` is True, we also compute a DINOv2-based foreground
+        mask (using last-block CLS attention from the *original* (non-flipped)
+        pass, to avoid averaging attention across flips) and soft-suppress
+        background pixels in the anomaly map. This costs essentially no extra
+        compute because attention is harvested during the same forward pass.
+
+        Memory note: views is (V,3,H,W). We flip views on-device and run DINO
+        in micro-batches, keeping only one augmentation's anomaly map
+        resident at a time; the weighted sum is accumulated in-place to
+        avoid materialising a (4, V, H, W) tensor.
         """
         augs = tta_flips(views) if self.cfg.use_tta else [("orig", views)]
         V = views.shape[0]
@@ -343,16 +382,51 @@ class CSIGAnomalyPipeline:
         dino_map = torch.zeros(V, H, W, device=views.device, dtype=torch.float32)
         pv_sum = torch.zeros(V, device=views.device, dtype=torch.float32)
         wsum = 0.0
-        for name, x in augs:
+        fg_mask = None
+
+        for idx, (name, x) in enumerate(augs):
             w = self.cfg.tta_weight_orig if name == "orig" else self.cfg.tta_weight_flip
-            res = self._dino_forward(x, cls, return_map=True)
+            # Only request attention from the ORIGINAL pass (first aug);
+            # flipped attention would need unflip and adds little.
+            need_attn = apply_fg and (name == "orig") and (fg_mask is None)
+            res = self._dino_forward(x, cls, return_map=True, return_fg=need_attn)
             amap = unflip_map(res["anomaly_map"].unsqueeze(1), name).squeeze(1)
             dino_map.add_(amap, alpha=w)
             pv_sum.add_(res["image_score"], alpha=w)
             wsum += w
+            if need_attn and "last_attn" in res:
+                try:
+                    last_attn = res["last_attn"]  # (V, Hp, Wp)
+                    fg_mask = foreground_from_last_attn(
+                        last_attn, out_size=self.cfg.input_size,
+                        percentile=self.cfg.fg_percentile,
+                        smooth_sigma=self.cfg.fg_smooth_sigma,
+                    ).to(amap.dtype)  # (V,1,H,W)
+                    if fg_mask.shape[0] != amap.shape[0]:
+                        # shape mismatch -- foreground not safe to apply
+                        fg_mask = None
+                except Exception:
+                    fg_mask = None
             del res, amap, x
         dino_map.div_(wsum)
         pv = pv_sum.div_(wsum)
+
+        # ---- Foreground suppression (apply on the TTA-averaged map) ----
+        if apply_fg and fg_mask is not None:
+            # fg_mask: (V,1,H,W), dino_map: (V,H,W)
+            dino_map = apply_foreground(dino_map, fg_mask,
+                                        lam=self.cfg.fg_bg_floor)
+            # Re-weight per-view image scores toward foreground max response
+            # (background suppression reduces pv for all-normal backgrounds,
+            # which otherwise dominate the average). We recompute pv using
+            # foreground-weighted max rather than raw amap max.
+            w_fg = fg_mask.squeeze(1).clamp(min=self.cfg.fg_bg_floor)  # (V,H,W)
+            pv_fg = (dino_map * w_fg).flatten(1).max(dim=1).values
+            # Blend original pv (calibrated on train) with fg-weighted pv
+            pv = 0.5 * pv + 0.5 * pv_fg
+            del w_fg, pv_fg
+            del fg_mask
+
         img_raw = aggregate_image_scores(
             pv.unsqueeze(0), strategy=self.cfg.mv_aggregate
         )  # (1,)
@@ -432,16 +506,29 @@ class CSIGAnomalyPipeline:
         print("[fit] Building coreset memory banks (batched FPS on GPU) ...",
               flush=True)
         coreset_dev = "cuda" if (self.cfg.coreset_on_gpu and self.device.type == "cuda") else "cpu"
+        hn_k = int(getattr(self.cfg, "hard_negative_k", 0) or 0)
         try:
             self.patchcore.build(device=coreset_dev, bank_device="cpu",
-                                 verbose=True, progress=True)
+                                 verbose=True, progress=True,
+                                 hard_negative_k=hn_k)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) or "out of memory" in str(e):
                 self._empty_cache()
                 print(f"[fit] coreset on {coreset_dev} failed with OOM, retrying on CPU ...",
                       flush=True)
-                self.patchcore.build(device="cpu", bank_device="cpu",
-                                     verbose=True, progress=True)
+                try:
+                    self.patchcore.build(device="cpu", bank_device="cpu",
+                                         verbose=True, progress=True,
+                                         hard_negative_k=hn_k)
+                except RuntimeError as ee:
+                    if "out of memory" in str(ee).lower():
+                        print("[fit] CPU coreset OOM too -- retrying without hard negatives",
+                              flush=True)
+                        self.patchcore.build(device="cpu", bank_device="cpu",
+                                             verbose=True, progress=True,
+                                             hard_negative_k=0)
+                    else:
+                        raise
             else:
                 raise
         self._empty_cache()
@@ -482,8 +569,11 @@ class CSIGAnomalyPipeline:
                 self._ensure_bank_on_device(cls, banks_mode)
                 prev_cls = cls
 
-            # Run the identical DINO (with TTA) pipeline used at inference
-            img_raw, dino_map = self._dino_tta_forward(views, cls)
+            # Run the IDENTICAL DINO (with TTA + foreground) pipeline used at
+            # inference so calibration percentiles match the runtime maps.
+            img_raw, dino_map = self._dino_tta_forward(
+                views, cls, apply_fg=self.cfg.use_foreground_mask
+            )
             img_buf[cls].append(float(img_raw.item()))
             # Subsample map pixels to keep CPU memory low.
             flat = dino_map.detach().reshape(-1).cpu()
@@ -529,8 +619,10 @@ class CSIGAnomalyPipeline:
         """
         V = views_448.shape[0]
 
-        # ---- DINOv2 + PatchCore (with TTA) ----
-        dino_img_raw, dino_map = self._dino_tta_forward(views_448, cls)
+        # ---- DINOv2 + PatchCore (with TTA + optional foreground suppression) ----
+        dino_img_raw, dino_map = self._dino_tta_forward(
+            views_448, cls, apply_fg=self.cfg.use_foreground_mask
+        )
         # Calibrate DINO image score to [0,1] using TRAIN-SET percentiles.
         dino_img_score = self.calibrator.apply(cls, dino_img_raw).clamp(0.0, 1.0)  # (1,)
         del dino_img_raw
@@ -600,6 +692,28 @@ class CSIGAnomalyPipeline:
                                       mode=self.cfg.mv_mask_vote).squeeze(0)
         # Final safety clamp
         ens_map = ens_map.clamp(0.0, 1.0)
+
+        # ---- Connected-component size suppression (per view) ----
+        # Remove tiny (mostly salt-and-pepper / edge artefact) components that
+        # are too small to correspond to real defects at 448x448. Operates per
+        # view on the calibrated [0,1] map BEFORE gamma correction. Uses a
+        # pure-PyTorch two-pass labelling (no scipy dependency at inference).
+        cc_min = int(getattr(self.cfg, "cc_min_area", 0) or 0)
+        if cc_min > 0 and cc_min >= 4:
+            cc_th = float(getattr(self.cfg, "cc_threshold", 0.30))
+            cc_kill = float(getattr(self.cfg, "cc_kill_factor", 0.1))
+            cleaned = []
+            for v in range(ens_map.shape[0]):
+                cleaned.append(
+                    remove_small_components_torch(
+                        ens_map[v], threshold=cc_th,
+                        min_area=cc_min, min_area_kill=cc_kill
+                    )
+                )
+            ens_map = torch.stack(cleaned, dim=0)
+            ens_map = ens_map.clamp(0.0, 1.0)
+            del cleaned
+
         score = float(ens_score.item())
         out_np = ens_map.cpu().numpy()
         del ens_map, ens_score
