@@ -261,11 +261,13 @@ def greedy_coreset(features: Tensor, n_select: int,
 # ---------------------------------------------------------------------------
 @dataclass
 class ClassBank:
-    features: Tensor           # (M, D) memory bank, L2-normalised
+    features: Tensor           # (M, D) memory bank, whitened + L2-normalised
     feat_dim: int              # D
     Hp: int
     Wp: int
-    cls_prototype: Tensor      # (D,) mean CLS token, L2-normalised
+    cls_prototype: Tensor      # (D,) mean CLS token, whitened + L2-normalised
+    W: Optional[Tensor] = None # (D, D) whitening matrix (ZCA), or None
+    mean: Optional[Tensor] = None  # (D,) per-class training mean
 
 
 class MultiClassPatchCore:
@@ -294,7 +296,9 @@ class MultiClassPatchCore:
                  knn_chunk: int = 512,
                  raw_store_fp16: bool = True,
                  coreset_batch: int = 64,
-                 coreset_presample_ratio: float = 3.0):
+                 coreset_presample_ratio: float = 3.0,
+                 use_whitening: bool = False,
+                 whitening_eps: float = 0.01):
         self.coreset_ratio = coreset_ratio
         self.coreset_max = coreset_max
         self.neighbourhood_size = neighbourhood_size
@@ -304,12 +308,12 @@ class MultiClassPatchCore:
         self.smooth_sigma = smooth_sigma
         self.cls_bank_weight = cls_bank_weight
         self.random_proj_dim = random_proj_dim
-        # Memory-tuning knobs
-        self.knn_chunk = int(knn_chunk)               # lower = less peak VRAM for kNN matmul
-        self.raw_store_fp16 = bool(raw_store_fp16)    # store raw train patches in fp16 (halves CPU RAM)
-        # Speed-tuning knobs for greedy coreset selection
-        self.coreset_batch = int(coreset_batch)       # FPS batch size (#points picked per matmul), higher=faster
-        self.coreset_presample_ratio = float(coreset_presample_ratio)  # random presample ratio before FPS, 0/None to disable
+        self.knn_chunk = int(knn_chunk)
+        self.raw_store_fp16 = bool(raw_store_fp16)
+        self.coreset_batch = int(coreset_batch)
+        self.coreset_presample_ratio = float(coreset_presample_ratio)
+        self.use_whitening = bool(use_whitening)
+        self.whitening_eps = float(whitening_eps)
         self.banks: Dict[str, ClassBank] = {}
         self._raw_features: Dict[str, List[Tensor]] = {}
         self._raw_cls: Dict[str, List[Tensor]] = {}
@@ -447,6 +451,46 @@ class MultiClassPatchCore:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
+            # ---- Optional per-dim whitening (diagonal Mahalanobis) ----
+            # Estimate per-dim mean/std of NORMAL patch features from a
+            # random subset of raw training patches, then:
+            #   bank  <- normalize((bank - mean_patch) / std)
+            #   query <- normalize((query - mean_patch) / std)
+            # CLS token is NOT whitened (it's a global pooled descriptor,
+            # not a patch -- whitening it with patch statistics is wrong
+            # and breaks the CLS-distance term). We use raw CLS features
+            # for the CLS-prototype term regardless of whitening.
+            W_diag = None
+            feats_mean = None
+            if self.use_whitening:
+                try:
+                    n_sub = min(all_feats.shape[0],
+                                getattr(self, "whitening_max_samples", 16384))
+                    if n_sub < all_feats.shape[0]:
+                        g = torch.Generator(device="cpu").manual_seed(0)
+                        idx = torch.randperm(all_feats.shape[0], generator=g)[:n_sub]
+                        feats_sub = all_feats[idx].to(compute_dev).float()
+                    else:
+                        feats_sub = all_feats.to(compute_dev).float()
+                    feats_sub = F.normalize(feats_sub, dim=-1)
+                    feats_mean = feats_sub.mean(0, keepdim=True).cpu()  # (1,D)
+                    std = feats_sub.std(0, unbiased=False).clamp(min=self.whitening_eps)  # (D,)
+                    W_diag = (1.0 / std).cpu()
+                    # Whiten the bank (patches only)
+                    bank_d = bank.to(compute_dev).float()
+                    bank_d = (bank_d - feats_mean.to(compute_dev)) * W_diag.to(compute_dev)
+                    bank = F.normalize(bank_d, dim=-1).cpu().contiguous()
+                    del feats_sub, bank_d
+                except Exception as e:
+                    if verbose:
+                        print(f"[coreset] whitening failed for {cls}: {e} -- skipping",
+                              flush=True)
+                    W_diag = None
+                    feats_mean = None
+                if torch.cuda.is_available() and compute_dev.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            # Build prototype from raw (non-whitened) CLS features
             proto = F.normalize(all_cls.to(compute_dev).float().mean(0, keepdim=True),
                                 dim=-1).squeeze(0)
             self.banks[cls] = ClassBank(
@@ -454,6 +498,8 @@ class MultiClassPatchCore:
                 feat_dim=bank.shape[1],
                 Hp=self.Hp, Wp=self.Wp,
                 cls_prototype=proto.to(bank_device).contiguous(),
+                W=W_diag.to(bank_device) if W_diag is not None else None,
+                mean=feats_mean.to(bank_device) if feats_mean is not None else None,
             )
             # Release memory immediately
             del all_feats, all_cls, bank, proto
@@ -481,6 +527,10 @@ class MultiClassPatchCore:
             if bank.features.device != dev:
                 bank.features = bank.features.to(dev)
                 bank.cls_prototype = bank.cls_prototype.to(dev)
+                if bank.W is not None:
+                    bank.W = bank.W.to(dev)
+                if bank.mean is not None:
+                    bank.mean = bank.mean.to(dev)
 
     def banks_to_cpu(self):
         """Evict all banks back to CPU to free GPU memory."""
@@ -488,6 +538,10 @@ class MultiClassPatchCore:
             if bank.features.device.type != "cpu":
                 bank.features = bank.features.to("cpu")
                 bank.cls_prototype = bank.cls_prototype.to("cpu")
+                if bank.W is not None:
+                    bank.W = bank.W.to("cpu")
+                if bank.mean is not None:
+                    bank.mean = bank.mean.to("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -551,6 +605,10 @@ class MultiClassPatchCore:
         if bank.features.device != dev:
             bank.features = bank.features.to(dev)
             bank.cls_prototype = bank.cls_prototype.to(dev)
+            if bank.W is not None:
+                bank.W = bank.W.to(dev)
+            if bank.mean is not None:
+                bank.mean = bank.mean.to(dev)
         bank_feats = bank.features
 
         # Make sure bank is in fp32 for the kNN matmul (fp16 matmul of
@@ -563,6 +621,22 @@ class MultiClassPatchCore:
 
         B, D, Hp, Wp = patch_feat.shape
         flat_p = patch_feat.float().permute(0, 2, 3, 1).reshape(-1, D)
+
+        # Apply per-dim whitening to PATCH features only.
+        # The CLS token vector is a global pooled descriptor in a different
+        # distribution (mean ≈ 0 after centering the patches, but its variance
+        # structure is unrelated to patch variance); whitening it with patch
+        # statistics destroys the CLS-prototype distance. We keep cls_dist
+        # in raw feature space.
+        if bank.W is not None and bank.mean is not None:
+            W_diag = bank.W
+            mu = bank.mean
+            if W_diag.device != flat_p.device:
+                W_diag = W_diag.to(flat_p.device)
+                mu = mu.to(flat_p.device)
+            flat_p = F.normalize((flat_p - mu) * W_diag, dim=-1)
+        cls_feat_f = cls_feat.float()
+
         d = self._nearest_neighbour_distance(flat_p, bank_feats)
         amap = d.reshape(B, 1, Hp, Wp)
 
@@ -592,7 +666,7 @@ class MultiClassPatchCore:
             proto = proto.reshape(-1, 1)
         if proto.dtype != torch.float32:
             proto = proto.float()
-        cls_dist = 1.0 - (cls_feat @ proto).squeeze(-1)  # (B,)
+        cls_dist = 1.0 - (cls_feat_f @ proto).squeeze(-1)  # (B,)
         img_score = (1.0 - self.cls_bank_weight) * patch_score \
                   + self.cls_bank_weight * cls_dist
 

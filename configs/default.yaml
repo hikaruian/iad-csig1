@@ -1,19 +1,17 @@
 # Default configuration for CSIG / Real-IAD Variety challenge
 # ------------------------------------------------------------
-# P-AP optimised defaults (v3 -- bug-fixed). This is a conservative config
-# that should match or slightly beat paplus.yaml (I-AUROC 0.879, P-AP
-# 0.296, score 65.6). For best P-AP use configs/paplus2fix.yaml.
+# P-AP optimized defaults (v4 -- bug-fixed).
 #
-# v2 vs v3 fixes:
-#   * Foreground signal switched from raw CLS attention (unreliable on
-#     DINOv2-L / iBOT) to final-norm CLS<->patch cosine saliency.
-#   * Foreground now acts on the ANOMALY MAP ONLY -- no per-view image
-#     score re-weighting (the old pv_fg blend collapsed calibration and
-#     cratered I-AUROC to 0.67).
-#   * Hard-negative mining OFF by default (2048 HNs expanded the bank
-#     envelope too much and crushed anomaly dynamic range).
+# Key fixes vs paplus2fix round:
+#   * Foreground mask is now applied AFTER percentile normalisation
+#     (previously it was applied inside TTA before calibration, which
+#     caused calibration percentiles to absorb the suppression and the
+#     mask had zero net effect -- hence paplus2fix metrics matched paplus).
+#   * Diagonal-Mahalanobis whitening available via use_whitening=true.
+#   * fg_hard_threshold option to zero-out low-saliency background.
 #
-# Expected peak GPU memory: ~3.2 GB.
+# Expected peak GPU memory: ~3.3 GB (448px) per GPU.
+# For best P-AP see configs/paplus_best.yaml, then paplus_aggressive.yaml.
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
@@ -28,7 +26,6 @@ clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
 clip_mask_ens: false
 
-# --- PatchCore++ ---
 coreset_ratio: 0.025
 coreset_max: 20480
 neighbourhood_size: 1
@@ -42,49 +39,45 @@ random_proj_dim: 256
 
 hard_negative_k: 0
 
-# --- Foreground (off by default; enable for P-AP) ---
-use_foreground_mask: false
+use_foreground_mask: false   # off by default (risky on DINOv2-L/14+registers)
 fg_percentile: 35.0
 fg_bg_floor: 0.20
 fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
 
-# --- CC cleanup ---
+use_whitening: false         # off by default
+whitening_eps: 0.01
+
 cc_min_area: 20
-cc_threshold: 0.35
+cc_threshold: 0.30
 cc_kill_factor: 0.10
 
-# --- Multi-view ---
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
 use_mv_attn: false
 mv_mask_vote: "none"
 
-# --- TTA ---
 use_tta: true
 tta_weight_orig: 1.0
 tta_weight_flip: 0.5
 
-# --- Ensemble ---
 ens_dino_weight: 1.0
-ens_clip_weight: 0.22
+ens_clip_weight: 0.20
 
-# --- Calibration ---
 dino_map_lo_q: 0.60
 dino_map_hi_q: 0.997
 dino_img_lo_q: 0.05
 dino_img_hi_q: 0.95
 
-# --- Gamma ---
 mask_gamma: 2.0
 
-# --- Runtime ---
 batch_size: 2
 clip_batch_size: 1
 dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: true
+banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42

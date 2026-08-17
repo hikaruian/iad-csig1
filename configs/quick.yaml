@@ -37,7 +37,7 @@ dino_view_micro: 4
 knn_chunk: 1024
 num_workers: 4
 use_amp: true
-banks_on_gpu: true
+banks_on_gpu: false
 coreset_on_gpu: true
 raw_store_fp16: true
 device: "cuda"

@@ -61,7 +61,7 @@ dino_view_micro: 1          # one view at a time -> minimum activation peak
 knn_chunk: 256
 num_workers: 2
 use_amp: true
-banks_on_gpu: true
+banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42

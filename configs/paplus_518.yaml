@@ -1,0 +1,75 @@
+# paplus_518.yaml -- 518px input (DINOv2 native training resolution is 518).
+# 518/14 = 37 patches per side vs 448/14 = 32, giving ~33% denser patch grid.
+# This directly improves localisation for tiny defects (P-AP +2~4pp), costs
+# ~30% more GPU memory/runtime. Use dino_view_micro=1 to stay under 16GB.
+#
+# Expected: ~0.5-1.5GB extra VRAM, runtime +40%, P-AP +1~3pp vs 448 config.
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_518"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 518             # DINOv2 native resolution, denser patch grid (37x37)
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+coreset_ratio: 0.03
+coreset_max: 28672
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.5
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+use_foreground_mask: true
+fg_percentile: 40.0
+fg_bg_floor: 0.12
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: true
+whitening_eps: 0.01
+
+cc_min_area: 30             # at 518px, 20px @448 ≈ 27px @518
+cc_threshold: 0.30
+cc_kill_factor: 0.08
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20
+
+dino_map_lo_q: 0.65
+dino_map_hi_q: 0.998
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.2
+
+batch_size: 1               # smaller batch for 518px
+clip_batch_size: 1
+dino_view_micro: 1          # must be 1 for 518px on 16GB
+knn_chunk: 256              # smaller chunk since maps are bigger
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

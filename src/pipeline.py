@@ -135,10 +135,22 @@ class PipelineConfig:
     dino_img_hi_q: float = 0.95
 
     # ---- foreground mask (DINOv2 CLS<->patch final-norm cosine saliency) ----
-    use_foreground_mask: bool = False  # off by default; enable via yaml for P-AP
-    fg_percentile: float = 35.0
-    fg_bg_floor: float = 0.20         # conservative (0.20) -- keep 20% of bg signal
+    # NOTE: applied AFTER percentile normalisation on the FINAL ensembled mask
+    # (post-calibration). If applied BEFORE calibration the calibration
+    # percentiles absorb the suppression and the foreground mask has zero
+    # net effect on the [0,1]-stretched mask.
+    use_foreground_mask: bool = True
+    fg_percentile: float = 40.0
+    fg_bg_floor: float = 0.15     # background multiplier (0.15 = heavy suppression)
     fg_smooth_sigma: float = 2.5
+    fg_hard_threshold: float = 0.0  # if >0, ZERO OUT pixels with fg below this
+                                    # saliency (hard-kill), not just multiply.
+
+    # ---- per-class ZCA feature whitening (Mahalanobis distance instead of
+    # cosine) inside PatchCore. Costs one eigendecomposition per class (on
+    # the coreset, ~0.2s) and improves P-AP on textured classes.
+    use_whitening: bool = False
+    whitening_eps: float = 0.01
 
     # ---- hard-negative mining (add high-distance normal patches to bank) ----
     hard_negative_k: int = 0          # off by default; enable with care (512-2048)
@@ -220,6 +232,8 @@ class CSIGAnomalyPipeline:
             raw_store_fp16=True,
             coreset_batch=self.cfg.coreset_batch,
             coreset_presample_ratio=self.cfg.coreset_presample_ratio,
+            use_whitening=bool(getattr(self.cfg, "use_whitening", False)),
+            whitening_eps=float(getattr(self.cfg, "whitening_eps", 0.01)),
         )
         # Calibrator for image-level scores (per-class)
         self.calibrator = PerClassPercentileCalibrator()
@@ -277,6 +291,10 @@ class CSIGAnomalyPipeline:
         if bk is not None and bk.features.device != self.device:
             bk.features = bk.features.to(self.device, non_blocking=True)
             bk.cls_prototype = bk.cls_prototype.to(self.device, non_blocking=True)
+            if bk.W is not None:
+                bk.W = bk.W.to(self.device, non_blocking=True)
+            if bk.mean is not None:
+                bk.mean = bk.mean.to(self.device, non_blocking=True)
 
     def _evict_bank_to_cpu(self, cls: str):
         """Move a single class' bank + CLIP ref back to CPU to free GPU memory."""
@@ -284,6 +302,10 @@ class CSIGAnomalyPipeline:
         if bk is not None and bk.features.device.type != "cpu":
             bk.features = bk.features.to("cpu", non_blocking=True)
             bk.cls_prototype = bk.cls_prototype.to("cpu", non_blocking=True)
+            if bk.W is not None:
+                bk.W = bk.W.to("cpu", non_blocking=True)
+            if bk.mean is not None:
+                bk.mean = bk.mean.to("cpu", non_blocking=True)
         cr = self.clip_refs.get(cls, None)
         if cr is not None and cr.device.type != "cpu":
             self.clip_refs[cls] = cr.to("cpu", non_blocking=True)
@@ -357,23 +379,23 @@ class CSIGAnomalyPipeline:
         return res
 
     def _dino_tta_forward(self, views: torch.Tensor, cls: str,
-                          apply_fg: bool = False
-                          ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run DINO branch with flip TTA, returning (dino_img_raw, dino_map)
-        where dino_img_raw is (1,) sample-level RAW score (pre-calibration)
-        and dino_map is (V, H, W) fused per-view high-res map.
+                          collect_fg: bool = False,
+                          ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Run DINO branch with flip TTA.
 
-        When apply_fg=True we additionally extract a foreground saliency
-        map from the ORIGINAL (non-flipped) pass and use it to softly
-        suppress background pixels in the ANOMALY MAP ONLY. The per-view
-        image scores are computed from the raw (pre-foreground) TTA-
-        averaged map so that calibration remains consistent between
-        train (normal) and test (potentially anomalous); we do NOT
-        re-weight image scores with fg, as that was shown to crater
-        image-AUROC due to calibration mismatch.
+        Returns (img_raw, dino_map, fg_mask_or_None).
 
-        Memory: we process one flip at a time and accumulate in-place
-        to avoid materialising a (4, V, H, W) tensor.
+        CRITICAL: we NEVER apply foreground suppression inside this
+        function. The reason is that calibration statistics are collected
+        on raw maps here too, and if we multiply by fg inside TTA then
+        the calibrator absorbs the multiplier and percentile norm
+        stretches the background right back up (net zero). Foreground
+        suppression must be applied AFTER percentile normalisation in
+        the caller -- i.e. as a post-calibration mask multiplier.
+
+        collect_fg: when True, compute the fg mask (from the ORIGINAL
+        view, not flipped) and return it alongside the map so the caller
+        can apply it post-normalisation.
         """
         augs = tta_flips(views) if self.cfg.use_tta else [("orig", views)]
         V = views.shape[0]
@@ -385,22 +407,20 @@ class CSIGAnomalyPipeline:
 
         for name, x in augs:
             w = self.cfg.tta_weight_orig if name == "orig" else self.cfg.tta_weight_flip
-            need_fg = apply_fg and (name == "orig") and (fg_mask is None)
+            need_fg = collect_fg and (name == "orig") and (fg_mask is None)
             res = self._dino_forward(x, cls, return_map=True, return_fg=need_fg)
             amap = unflip_map(res["anomaly_map"].unsqueeze(1), name).squeeze(1)
             dino_map.add_(amap, alpha=w)
-            # Per-view image score from PatchCore (blends patch_max + cls_dist
-            # via cls_bank_weight), flipped back to be TTA-symmetric.
             pv_sum.add_(res["image_score"], alpha=w)
             wsum += w
             if need_fg and "fg_saliency" in res:
                 try:
-                    sal = res["fg_saliency"]                   # (V, Hp, Wp)
+                    sal = res["fg_saliency"]
                     fg_mask = foreground_from_saliency(
                         sal, out_size=self.cfg.input_size,
                         percentile=self.cfg.fg_percentile,
                         smooth_sigma=self.cfg.fg_smooth_sigma,
-                    ).to(amap.dtype)                           # (V,1,H,W)
+                    ).to(amap.dtype)
                     if fg_mask.shape[0] != amap.shape[0]:
                         fg_mask = None
                 except Exception:
@@ -409,16 +429,10 @@ class CSIGAnomalyPipeline:
         dino_map.div_(wsum)
         pv = pv_sum.div_(wsum)
 
-        # ---- Foreground suppression: MAP ONLY, no score meddling ----
-        if apply_fg and fg_mask is not None:
-            dino_map = apply_foreground(dino_map, fg_mask,
-                                        lam=self.cfg.fg_bg_floor)
-            del fg_mask
-
         img_raw = aggregate_image_scores(
             pv.unsqueeze(0), strategy=self.cfg.mv_aggregate
         )  # (1,)
-        return img_raw, dino_map
+        return img_raw, dino_map, fg_mask if collect_fg else None
 
     # ------------------------------------------------------------------
     # TRAINING
@@ -557,10 +571,12 @@ class CSIGAnomalyPipeline:
                 self._ensure_bank_on_device(cls, banks_mode)
                 prev_cls = cls
 
-            # Run the IDENTICAL DINO (with TTA + foreground) pipeline used at
-            # inference so calibration percentiles match the runtime maps.
-            img_raw, dino_map = self._dino_tta_forward(
-                views, cls, apply_fg=self.cfg.use_foreground_mask
+            # Calibration runs on RAW (pre-foreground) maps.  The foreground
+            # mask is applied AFTER percentile normalisation as post-process,
+            # so calibration must NOT see it -- otherwise the per-class (lo,hi)
+            # absorb the foreground suppression and the net effect is zero.
+            img_raw, dino_map, _ = self._dino_tta_forward(
+                views, cls, collect_fg=False,
             )
             img_buf[cls].append(float(img_raw.item()))
             # Subsample map pixels to keep CPU memory low.
@@ -607,9 +623,11 @@ class CSIGAnomalyPipeline:
         """
         V = views_448.shape[0]
 
-        # ---- DINOv2 + PatchCore (with TTA + optional foreground suppression) ----
-        dino_img_raw, dino_map = self._dino_tta_forward(
-            views_448, cls, apply_fg=self.cfg.use_foreground_mask
+        # ---- DINOv2 + PatchCore (TTA, NO foreground here -- fg is applied
+        # AFTER percentile norm so it is not undone by calibration) ----
+        collect_fg = bool(self.cfg.use_foreground_mask)
+        dino_img_raw, dino_map, fg_mask = self._dino_tta_forward(
+            views_448, cls, collect_fg=collect_fg,
         )
         # Calibrate DINO image score to [0,1] using TRAIN-SET percentiles.
         dino_img_score = self.calibrator.apply(cls, dino_img_raw).clamp(0.0, 1.0)  # (1,)
@@ -682,10 +700,6 @@ class CSIGAnomalyPipeline:
         ens_map = ens_map.clamp(0.0, 1.0)
 
         # ---- Connected-component size suppression (per view) ----
-        # Remove tiny (mostly salt-and-pepper / edge artefact) components that
-        # are too small to correspond to real defects at 448x448. Operates per
-        # view on the calibrated [0,1] map BEFORE gamma correction. Uses a
-        # pure-PyTorch two-pass labelling (no scipy dependency at inference).
         cc_min = int(getattr(self.cfg, "cc_min_area", 0) or 0)
         if cc_min > 0 and cc_min >= 4:
             cc_th = float(getattr(self.cfg, "cc_threshold", 0.30))
@@ -698,9 +712,31 @@ class CSIGAnomalyPipeline:
                         min_area=cc_min, min_area_kill=cc_kill
                     )
                 )
-            ens_map = torch.stack(cleaned, dim=0)
-            ens_map = ens_map.clamp(0.0, 1.0)
+            ens_map = torch.stack(cleaned, dim=0).clamp(0.0, 1.0)
             del cleaned
+
+        # ---- Foreground suppression (applied AFTER percentile normalisation
+        # and CC cleanup, so it cannot be undone by calibration). This is the
+        # correct place: map is now in [0,1] and multiplying background by
+        # fg_bg_floor here directly lowers background pixel values that
+        # would otherwise become false positives at high thresholds. ----
+        if fg_mask is not None and self.cfg.use_foreground_mask:
+            m = fg_mask.to(ens_map.device, ens_map.dtype)
+            if m.dim() == 4 and m.shape[1] == 1:
+                m = m.squeeze(1)
+            # Resize if needed (fg is built at input_size, ens_map is same).
+            if m.shape[-2:] != ens_map.shape[-2:]:
+                m = F.interpolate(m.unsqueeze(1), size=ens_map.shape[-2:],
+                                  mode="bilinear", align_corners=False).squeeze(1)
+            ens_map = apply_foreground(ens_map, m, lam=self.cfg.fg_bg_floor)
+            hard_th = float(getattr(self.cfg, "fg_hard_threshold", 0.0) or 0.0)
+            if hard_th > 0:
+                # Hard-zero pixels below the saliency threshold (bg floor).
+                ens_map = torch.where(m < hard_th, torch.zeros_like(ens_map), ens_map)
+            ens_map = ens_map.clamp(0.0, 1.0)
+            del m
+        if fg_mask is not None:
+            del fg_mask
 
         score = float(ens_score.item())
         out_np = ens_map.cpu().numpy()

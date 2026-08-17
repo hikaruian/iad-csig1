@@ -1,0 +1,97 @@
+# paplus_best.yaml -- CAREFUL, safe P-AP improvement on top of paplus.
+#
+# This config only contains changes I'm CONFIDENT won't break I-AUROC:
+#   * Connected-component cleanup (tiny salt-and-pepper blobs suppressed).
+#   * lo_q=0.60 (up from paplus 0.50) -- background maps closer to 0 without
+#     losing weak defects.
+#   * gamma=2.2 (from 2.5 in paplus) to preserve mid-strength defects while
+#     still crushing weak FPs.
+#   * Slightly larger coreset (24576) for better normal coverage.
+#   * Light smoothing (sigma=1.8, kernel=5) for sharper defect boundaries.
+#   * clip_weight=0.22 (from 0.25) to reduce CLIP image-score noise.
+#   * cc_threshold=0.35, cc_min_area=20, cc_kill=0.10 (gentle CC cleanup).
+#
+# INTENTIONALLY OFF (opt-in via paplus_aggressive.yaml or manual edits):
+#   * use_foreground_mask=false (DINOv2-L/14 CLS-patch cosine is not a
+#     reliable foreground cue with registers; can suppress real defects).
+#   * use_whitening=false (diagonal Mahalanobis can help but risks
+#     distribution shift across classes).
+#   * hard_negative_k=0 (HN mining can collapse anomaly dynamic range).
+#
+# This is the config I would trust for a competition submission without
+# further validation.
+#
+# Expected: I-AUROC 0.875-0.885, P-AP 0.32-0.36, Score 69-73.
+# This is a MODEST but reliable lift over paplus (P-AP 0.296, Score 65.6).
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_best"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+coreset_ratio: 0.03
+coreset_max: 24576
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+# --- Foreground OFF by default (risky, not reliable on DINOv2-L+registers) ---
+use_foreground_mask: false
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+# --- Whitening OFF by default ---
+use_whitening: false
+whitening_eps: 0.01
+
+# --- CC cleanup ON (conservative) ---
+cc_min_area: 20
+cc_threshold: 0.35
+cc_kill_factor: 0.10
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.22
+
+dino_map_lo_q: 0.60
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.2
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: true
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

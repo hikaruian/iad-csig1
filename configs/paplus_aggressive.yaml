@@ -1,0 +1,84 @@
+# paplus_aggressive.yaml -- EXPERIMENTAL: pushes for higher P-AP at small
+# risk to I-AUROC. Use ONLY after confirming paplus_best is stable and
+# you want to gamble for more P-AP.
+#
+# Adds over paplus_best:
+#   * Whitening ON (diagonal Mahalanobis) -- +1~2pp P-AP if classes are
+#     texture-dominated, may hurt on color-dominated classes.
+#   * Foreground mask ON (with floor=0.15) -- aggressive background FP
+#     suppression; risks suppressing edge defects.
+#   * CC cleanup tighter (threshold=0.30, kill=0.05).
+#   * Bigger coreset (32k) for better coverage.
+#   * fg_hard_threshold=0.0 (no hard zeroing; safer than 0.20).
+#
+# Expected (BEST CASE): I-AUROC 0.87-0.90, P-AP 0.36-0.42, Score 72-77.
+# Risk case:         I-AUROC drops 0.01-0.03 if fg/whitening hurt.
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_aggressive"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+coreset_ratio: 0.04
+coreset_max: 32768
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.5
+cls_bank_weight: 0.12
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+use_foreground_mask: true
+fg_percentile: 40.0
+fg_bg_floor: 0.15
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: true
+whitening_eps: 0.01
+
+cc_min_area: 25
+cc_threshold: 0.30
+cc_kill_factor: 0.05
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20
+
+dino_map_lo_q: 0.65
+dino_map_hi_q: 0.998
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.2
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

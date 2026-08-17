@@ -1,10 +1,9 @@
-# Champion config (v3 -- bug-fixed). Best-effort P-AP with I-AUROC preserved.
-# ===========================================================================
-# Try this only AFTER confirming paplus2fix works (I-AUROC>=0.88, P-AP>=0.34).
-# If paplus2fix I-AUROC is back to 0.88+ but P-AP <0.35, run this; it pushes
-# coreset size to 32k and enables a conservative foreground mask.
+# Champion config (v4 -- bug-fixed, conservative).
+# Best guess for highest total score. Mirrors paplus_best.yaml with
+# slightly larger coreset and gamma. After confirming paplus_best is
+# stable, try this for marginal extra P-AP.
 #
-# Expected peak GPU memory: ~3.8 GB per GPU (banks_on_gpu=false lazy swap).
+# Expected: I-AUROC ≥ 0.88, P-AP 0.34-0.38, Score 71-74.
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
@@ -24,21 +23,25 @@ coreset_max: 32768
 neighbourhood_size: 1
 n_neighbours: 1
 smooth_kernel: 5
-smooth_sigma: 1.5
+smooth_sigma: 1.8
 cls_bank_weight: 0.15
 coreset_batch: 64
 coreset_presample_ratio: 3.0
 random_proj_dim: 256
 
-hard_negative_k: 0      # enable to 512 only after confirming safe
+hard_negative_k: 0
 
-use_foreground_mask: true
-fg_percentile: 30.0
-fg_bg_floor: 0.20
+use_foreground_mask: false
+fg_percentile: 40.0
+fg_bg_floor: 0.15
 fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
 
-cc_min_area: 25
-cc_threshold: 0.30
+use_whitening: false
+whitening_eps: 0.01
+
+cc_min_area: 20
+cc_threshold: 0.35
 cc_kill_factor: 0.10
 
 mv_aggregate: "robust_mean"
@@ -53,12 +56,12 @@ tta_weight_flip: 0.5
 ens_dino_weight: 1.0
 ens_clip_weight: 0.20
 
-dino_map_lo_q: 0.65
-dino_map_hi_q: 0.998
+dino_map_lo_q: 0.62
+dino_map_hi_q: 0.997
 dino_img_lo_q: 0.05
 dino_img_hi_q: 0.95
 
-mask_gamma: 2.0
+mask_gamma: 2.2
 
 batch_size: 2
 clip_batch_size: 1
@@ -66,7 +69,7 @@ dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: true
+banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42
