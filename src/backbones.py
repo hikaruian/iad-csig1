@@ -105,89 +105,39 @@ class DINOv2FeatureExtractor(nn.Module):
         return self.extract_features(x)
 
     @torch.no_grad()
-    def extract_features(self, x: torch.Tensor, return_last_attn: bool = False
+    def extract_features(self, x: torch.Tensor, return_fg_saliency: bool = False
                          ) -> Dict[str, torch.Tensor]:
         """
         Parameters
         ----------
         x : (B, 3, H, W)
-        return_last_attn : if True, also returns ``"last_attn"`` -- the
-            CLS→patch attention weights from the FINAL transformer block,
-            useful as a free class-agnostic foreground/saliency map (see
-            Caron et al. DINO self-segmentation; costs no extra forward).
-
-        Returns
-        -------
-        dict with:
-            "cls"    : (B, D)           – <[BOS_never_used_51bce0c785ca2f68081bfa7d91973934]> token from the LAST block.
-            "patch"  : (B, D, Hp, Wp)   – FUSED multi-layer patch features.
-            "patch_layers": list[(B, D, Hp, Wp)] – per-layer patch features.
-            "last_attn": (B, Hp, Wp) [optional, if return_last_attn]
+        return_fg_saliency : if True, also return ``fg_saliency`` (B, Hp, Wp) --
+            the cosine similarity between the final-norm CLS token and each
+            final-norm patch token. This is the canonical DINO self-
+            segmentation signal (Caron et al. 2021) and is essentially free
+            (same forward pass). We deliberately do NOT use raw attention
+            weights: DINOv2 was trained with iBOT masked modelling and CLS
+            attention is not a clean foreground mask (it often lights up
+            context and background), whereas final-feature cosine is robust
+            across ViT-L checkpoints and is what practitioners actually use
+            for unsupervised saliency.
         """
         B, _, H, W = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0, \
             f"input H,W must be divisible by patch_size={self.patch_size}"
         Hp, Wp = H // self.patch_size, W // self.patch_size
 
-        # Prepare tokens following DINOv2's forward (handles CLS + optional
-        # register tokens that are prepended in newer DINOv2 checkpoints).
         x = self.model.prepare_tokens_with_masks(x)
-
-        # Newer DINOv2 checkpoints (e.g. dinov2_vitl14_reg) prepend extra
-        # register tokens between CLS and patch tokens. We detect their
-        # count so that we always slice the spatial patches correctly,
-        # rather than naively taking tokens[:, 1:] (which would mix in
-        # registers and produce garbage patch maps).
         n_register = getattr(self.model, "n_register_tokens", 0)
         patch_start = 1 + n_register
 
         patch_layers: List[torch.Tensor] = []
         cls_token = None
-        last_attn = None
-
-        # If the caller wants last-block attention, install a temporary
-        # forward hook on the LAST block's attn.qkv / attn.proj module.
-        # DINOv2 blocks use ``x = x + self.attn(self.norm1(x))`` where
-        # self.attn returns the post-proj attention output; attention
-        # weights are NOT exposed by default. Instead we re-run the final
-        # block's attention manually to read the CLS→patch weights.
-        last_block = self.model.blocks[-1]
 
         for i, blk in enumerate(self.model.blocks):
-            if return_last_attn and i == self.num_layers - 1:
-                # Manual attention extraction for the final block. We use a
-                # try/except because DINOv2's attention implementation varies
-                # across versions (some use fused SDPA, extra norms, etc.).
-                # If extraction fails we silently skip -- downstream falls
-                # back to no-foreground mask.
-                try:
-                    B_i, N, D_i = x.shape
-                    nx = blk.norm1(x)
-                    attn_mod = blk.attn
-                    num_heads = getattr(attn_mod, "num_heads", None) or getattr(attn_mod, "num_heads", None)
-                    if num_heads is not None and hasattr(attn_mod, "qkv"):
-                        head_dim = D_i // num_heads
-                        qkv = attn_mod.qkv(nx).reshape(B_i, N, 3, num_heads, head_dim)
-                        qkv = qkv.permute(2, 0, 3, 1, 4)
-                        q, k, _v = qkv.unbind(0)  # (B, heads, N, head_dim)
-                        scale = getattr(attn_mod, "scale", head_dim ** -0.5)
-                        aw = (q @ k.transpose(-2, -1)) * scale
-                        aw = aw.softmax(dim=-1)
-                        # CLS row -> patch columns, average over heads
-                        cls_attn = aw[:, :, 0, patch_start:].mean(dim=1)  # (B, Hp*Wp)
-                        last_attn = cls_attn.reshape(B, Hp, Wp)
-                        del qkv, q, k, _v, aw, cls_attn
-                except Exception:
-                    last_attn = None
-                # Run the block normally regardless
-                x = blk(x)
-            else:
-                x = blk(x)
-
+            x = blk(x)
             if i in self.layers:
-                # tokens[:, patch_start:] are spatial patches only
-                tokens = x  # (B, 1+reg+Hp*Wp, D)
-                patch_tokens = tokens[:, patch_start:, :]
+                patch_tokens = x[:, patch_start:, :]
                 patch_layers.append(
                     patch_tokens.reshape(B, Hp, Wp, -1)
                                  .permute(0, 3, 1, 2).contiguous()
@@ -196,21 +146,26 @@ class DINOv2FeatureExtractor(nn.Module):
                 cls_token = x[:, 0]
 
         x_norm = self.model.norm(x)
-        # After final norm, overwrite the CLS token with the normalized one
         cls_token = x_norm[:, 0]
 
-        # Multi-layer fusion: concat along channel, project to D, L2-normalise.
-        fused = torch.cat(patch_layers, dim=1)  # (B, k*D, Hp, Wp)
+        fused = torch.cat(patch_layers, dim=1)
         fused = self.fuse_proj(fused)
         fused = F.normalize(fused, dim=1)
 
-        return {
+        out = {
             "cls": F.normalize(cls_token, dim=-1),
             "patch": fused,
             "patch_layers": patch_layers,
             "Hp": Hp, "Wp": Wp,
-            **({"last_attn": last_attn} if last_attn is not None else {}),
         }
+
+        if return_fg_saliency:
+            cls_n = F.normalize(x_norm[:, 0:1], dim=-1)
+            pat_n = F.normalize(x_norm[:, patch_start:, :], dim=-1)
+            sim = (pat_n @ cls_n.transpose(-1, -2)).squeeze(-1)
+            out["fg_saliency"] = sim.reshape(B, Hp, Wp)
+
+        return out
 
 
 # ---------------------------------------------------------------------------

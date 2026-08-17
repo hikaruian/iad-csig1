@@ -1,11 +1,10 @@
-# Champion config (v2) -- best P-AP tuned for 16 GB+ GPUs (Kaggle 2x16GB).
+# Champion config (v3 -- bug-fixed). Best-effort P-AP with I-AUROC preserved.
 # ===========================================================================
-# This is the config that should win the competition. It layers every P-AP
-# trick from paplus2/paplus3 on top of a larger bank, while staying within
-# the Kaggle 2x16 GB VRAM budget (banks_on_gpu=false lazy swap; ~4 GB/run).
+# Try this only AFTER confirming paplus2fix works (I-AUROC>=0.88, P-AP>=0.34).
+# If paplus2fix I-AUROC is back to 0.88+ but P-AP <0.35, run this; it pushes
+# coreset size to 32k and enables a conservative foreground mask.
 #
-# Expected: I-AUROC >= 0.89, P-AP >= 0.38, total score ~72-76.
-# If P-AP still plateaus <0.35, try paplus3.yaml (more aggressive).
+# Expected peak GPU memory: ~3.8 GB per GPU (banks_on_gpu=false lazy swap).
 
 train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
@@ -20,9 +19,8 @@ clip_model: "ViT-L-14-336"
 clip_pretrained: "openai"
 clip_mask_ens: false
 
-# --- PatchCore++ ---------------------------------------------------------
 coreset_ratio: 0.04
-coreset_max: 32768           # large bank for best coverage
+coreset_max: 32768
 neighbourhood_size: 1
 n_neighbours: 1
 smooth_kernel: 5
@@ -32,52 +30,43 @@ coreset_batch: 64
 coreset_presample_ratio: 3.0
 random_proj_dim: 256
 
-# --- Hard-negative mining ------------------------------------------------
-hard_negative_k: 3072
+hard_negative_k: 0      # enable to 512 only after confirming safe
 
-# --- Foreground ----------------------------------------------------------
 use_foreground_mask: true
-fg_percentile: 35.0
-fg_bg_floor: 0.12
-fg_smooth_sigma: 2.0
+fg_percentile: 30.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
 
-# --- Connected-component cleanup ----------------------------------------
 cc_min_area: 25
 cc_threshold: 0.30
 cc_kill_factor: 0.10
 
-# --- Multi-view ----------------------------------------------------------
 mv_aggregate: "robust_mean"
 mv_vote_beta: 1.5
 use_mv_attn: false
 mv_mask_vote: "none"
 
-# --- TTA -----------------------------------------------------------------
 use_tta: true
 tta_weight_orig: 1.0
 tta_weight_flip: 0.5
 
-# --- Ensemble ------------------------------------------------------------
 ens_dino_weight: 1.0
 ens_clip_weight: 0.20
 
-# --- Calibration percentiles --------------------------------------------
-dino_map_lo_q: 0.70
+dino_map_lo_q: 0.65
 dino_map_hi_q: 0.998
 dino_img_lo_q: 0.05
 dino_img_hi_q: 0.95
 
-# --- Final mask gamma ----------------------------------------------------
 mask_gamma: 2.0
 
-# --- Runtime / memory ----------------------------------------------------
 batch_size: 2
 clip_batch_size: 1
 dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: false          # lazy swap per class (safer on 16 GB)
+banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42

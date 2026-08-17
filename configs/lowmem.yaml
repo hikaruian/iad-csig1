@@ -29,10 +29,10 @@ random_proj_dim: 256
 
 # Memory savers: disable hard-negative mining (avoids the extra training-pass)
 hard_negative_k: 0
-use_foreground_mask: true   # foreground is cheap; keep it
+use_foreground_mask: false   # off by default; turn on for +P-AP
 fg_percentile: 35.0
-fg_bg_floor: 0.15
-fg_smooth_sigma: 2.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
 cc_min_area: 20
 cc_threshold: 0.35
 cc_kill_factor: 0.10

@@ -1,0 +1,98 @@
+# paplus2fix.yaml -- bug-fixed P-AP config (v3).
+# =======================================================================
+# paplus2/paplus3 I-AUROC 崩掉的根因已修复：
+#   (a) 前景信号从"raw CLS attention"换成 final-norm 后 CLS<->patch 余弦
+#       相似度（DINO 自分割的真正信号，attention 在 DINOv2-L 上不可靠）。
+#   (b) 前景只作用于 mask，不再重写 per-view 图像分数（原版本 pv_fg 双重
+#       乘法让 p95-p50 动态范围被压扁，标定器输出二值化分数，AUROC 崩）。
+#   (c) hard_negative_k 默认关回 0（2048 个难分正常点把 bank 包络外扩太多，
+#       把真异常距离拉近）。可以小量（512）试，但先把安全增益吃完。
+#
+# 保留并微调的 P-AP 改进：
+#   * CC 连通域抑制（更保守：min_area=20, threshold=0.35, kill=0.10）
+#   * 余弦前景 mask（fg_percentile=30, floor=0.20 保守抑制，不会压掉小缺陷）
+#   * dino_map_lo_q=0.60（介于 paplus 的 0.50 和 paplus2 的 0.70，避免灰雾
+#     又不会把浅缺陷压暗）
+#   * smooth_kernel=5, smooth_sigma=1.8（保持 paplus 值，不过激）
+#   * mask_gamma=2.2（比 paplus 2.5 略温和，让中等强度真缺陷不被压）
+#   * coreset_max=24576（保持 paplus 值）
+#
+# 基线 (paplus): I-AUROC=0.879, P-AUROC=0.925, P-AP=0.296, score=65.58
+# 预期 (paplus2fix): I-AUROC≥0.88, P-AUROC≥0.93, P-AP≥0.34, score≥70.
+# 如果这个跑出来 I-AUROC 仍在 0.88+，下一步再开 hard_negative_k=512 和
+# lo_q=0.65 做小幅 push。
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus2fix"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+# --- PatchCore++ ---
+coreset_ratio: 0.03
+coreset_max: 24576
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+# --- Hard-negative mining (OFF for safety; try 512 later) ---
+hard_negative_k: 0
+
+# --- Foreground (cosine saliency, mask-only, conservative suppression) ---
+use_foreground_mask: true
+fg_percentile: 30.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+
+# --- Connected-component cleanup ---
+cc_min_area: 20
+cc_threshold: 0.35
+cc_kill_factor: 0.10
+
+# --- Multi-view ---
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+# --- TTA ---
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+# --- Ensemble ---
+ens_dino_weight: 1.0
+ens_clip_weight: 0.22
+
+# --- Calibration percentiles ---
+dino_map_lo_q: 0.60
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+# --- Mask gamma ---
+mask_gamma: 2.2
+
+# --- Runtime ---
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

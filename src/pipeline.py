@@ -24,7 +24,7 @@ from .backbones import CLIPFeatureExtractor, DINOv2FeatureExtractor
 from .dataset import (CSIGImageDataset, CSIGSampleDataset, build_test_transform,
                       build_train_transform, discover_classes,
                       IMAGENET_MEAN, IMAGENET_STD, CLIP_MEAN, CLIP_STD)
-from .foreground import (apply_foreground, foreground_from_last_attn,
+from .foreground import (apply_foreground, foreground_from_saliency,
                          remove_small_components_torch)
 from .multiview import (CrossViewAttention, aggregate_image_scores,
                         multiview_mask_vote)
@@ -134,19 +134,21 @@ class PipelineConfig:
     dino_img_lo_q: float = 0.05
     dino_img_hi_q: float = 0.95
 
-    # ---- foreground mask (DINOv2 last-block CLS attention) ----
-    use_foreground_mask: bool = True
-    fg_percentile: float = 35.0   # percentile threshold for foreground (lower = more aggressive)
-    fg_bg_floor: float = 0.15     # background multiplier floor (lower = more suppression)
-    fg_smooth_sigma: float = 2.0
+    # ---- foreground mask (DINOv2 CLS<->patch final-norm cosine saliency) ----
+    use_foreground_mask: bool = False  # off by default; enable via yaml for P-AP
+    fg_percentile: float = 35.0
+    fg_bg_floor: float = 0.20         # conservative (0.20) -- keep 20% of bg signal
+    fg_smooth_sigma: float = 2.5
 
     # ---- hard-negative mining (add high-distance normal patches to bank) ----
-    hard_negative_k: int = 2048   # extra normal patches to append per class; 0 disables
+    hard_negative_k: int = 0          # off by default; enable with care (512-2048)
+                                      # over-eager HN mining collapses the bank
+                                      # and kills image-AUROC.
 
     # ---- connected-component suppression ----
-    cc_min_area: int = 25         # components smaller than this (at 448x448) get suppressed
-    cc_threshold: float = 0.30    # binarisation threshold for CC detection
-    cc_kill_factor: float = 0.1   # tiny components multiplied by this factor
+    cc_min_area: int = 20
+    cc_threshold: float = 0.35
+    cc_kill_factor: float = 0.10
 
     # ---- post-processing ----
     mask_gamma: float = 2.0       # gamma on final masks (>1 suppresses weak FPs, boosts P-AP)
@@ -310,36 +312,33 @@ class CSIGAnomalyPipeline:
             return x.to(self.device, dtype=torch.float16, non_blocking=True)
         return x.to(self.device, non_blocking=True)
 
-    def _dino_backbone_micro(self, x: torch.Tensor, return_attn: bool = False
+    def _dino_backbone_micro(self, x: torch.Tensor, return_fg: bool = False
                              ) -> Dict[str, torch.Tensor]:
         """Run DINOv2 backbone in micro-batches of views to cap activation
         memory. Each micro-batch is concatenated back, matching the output
-        shape of a single big forward (B=V)."""
+        shape of a single big forward (B=V). When return_fg=True we also
+        harvest the final-norm CLS<->patch cosine saliency (free signal)
+        used by the foreground mask."""
         micro = max(1, int(self.cfg.dino_view_micro))
-        # The DINOv2 extractor supports return_last_attn=True; propagate.
-        # We use direct module call (not _run_backbone's DP wrapper) because
-        # DP won't pass through extra kwargs cleanly when use_dp is on --
-        # but use_dp default is False and the kaggle setup doesn't use it.
-        patches, clses, attns = [], [], []
+        patches, clses, fgs = [], [], []
         for i in range(0, x.shape[0], micro):
             sub = x[i:i+micro]
             if self.cfg.use_dp and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                # DP path: fall back to running without attention extraction
                 from .dist_utils import auto_parallel_forward
                 with self._autocast_ctx():
                     o = auto_parallel_forward(self.dino, sub)
             else:
                 with self._autocast_ctx():
-                    o = self.dino.extract_features(sub, return_last_attn=return_attn)
+                    o = self.dino.extract_features(sub, return_fg_saliency=return_fg)
             patches.append(o["patch"].float())
             clses.append(o["cls"].float())
-            if return_attn and "last_attn" in o:
-                attns.append(o["last_attn"].float())
+            if return_fg and "fg_saliency" in o:
+                fgs.append(o["fg_saliency"].float())
             del sub, o
         out = {"patch": torch.cat(patches, dim=0),
                "cls": torch.cat(clses, dim=0)}
-        if return_attn and attns:
-            out["last_attn"] = torch.cat(attns, dim=0)
+        if return_fg and fgs:
+            out["fg_saliency"] = torch.cat(fgs, dim=0)
         return out
 
     def _dino_forward(self, x: torch.Tensor, cls: str,
@@ -348,33 +347,33 @@ class CSIGAnomalyPipeline:
                       ) -> Dict[str, torch.Tensor]:
         """Run DINOv2 + PatchCore and return per-view image scores and
         (optionally) per-view high-res anomaly maps. Shared by training
-        calibration and inference so the two paths are NUMERICALLY IDENTICAL
-        (modulo TTA at inference time)."""
-        out = self._dino_backbone_micro(x, return_attn=return_fg)
-        # Outputs are already fp32; upcast was done in _dino_backbone_micro.
+        calibration and inference so the two paths are NUMERICALLY
+        IDENTICAL (mod TTA at inference time)."""
+        out = self._dino_backbone_micro(x, return_fg=return_fg)
         res = self.patchcore.predict(cls, out["patch"], out["cls"],
                                      return_map=return_map)
-        if return_fg and "last_attn" in out:
-            res["last_attn"] = out["last_attn"]
+        if return_fg and "fg_saliency" in out:
+            res["fg_saliency"] = out["fg_saliency"]
         return res
 
     def _dino_tta_forward(self, views: torch.Tensor, cls: str,
                           apply_fg: bool = False
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run DINO branch with flip TTA, returning (dino_img_raw, dino_map)
-        where dino_img_raw is (1,) sample-level raw score (pre-calibration)
+        where dino_img_raw is (1,) sample-level RAW score (pre-calibration)
         and dino_map is (V, H, W) fused per-view high-res map.
 
-        When ``apply_fg`` is True, we also compute a DINOv2-based foreground
-        mask (using last-block CLS attention from the *original* (non-flipped)
-        pass, to avoid averaging attention across flips) and soft-suppress
-        background pixels in the anomaly map. This costs essentially no extra
-        compute because attention is harvested during the same forward pass.
+        When apply_fg=True we additionally extract a foreground saliency
+        map from the ORIGINAL (non-flipped) pass and use it to softly
+        suppress background pixels in the ANOMALY MAP ONLY. The per-view
+        image scores are computed from the raw (pre-foreground) TTA-
+        averaged map so that calibration remains consistent between
+        train (normal) and test (potentially anomalous); we do NOT
+        re-weight image scores with fg, as that was shown to crater
+        image-AUROC due to calibration mismatch.
 
-        Memory note: views is (V,3,H,W). We flip views on-device and run DINO
-        in micro-batches, keeping only one augmentation's anomaly map
-        resident at a time; the weighted sum is accumulated in-place to
-        avoid materialising a (4, V, H, W) tensor.
+        Memory: we process one flip at a time and accumulate in-place
+        to avoid materialising a (4, V, H, W) tensor.
         """
         augs = tta_flips(views) if self.cfg.use_tta else [("orig", views)]
         V = views.shape[0]
@@ -384,26 +383,25 @@ class CSIGAnomalyPipeline:
         wsum = 0.0
         fg_mask = None
 
-        for idx, (name, x) in enumerate(augs):
+        for name, x in augs:
             w = self.cfg.tta_weight_orig if name == "orig" else self.cfg.tta_weight_flip
-            # Only request attention from the ORIGINAL pass (first aug);
-            # flipped attention would need unflip and adds little.
-            need_attn = apply_fg and (name == "orig") and (fg_mask is None)
-            res = self._dino_forward(x, cls, return_map=True, return_fg=need_attn)
+            need_fg = apply_fg and (name == "orig") and (fg_mask is None)
+            res = self._dino_forward(x, cls, return_map=True, return_fg=need_fg)
             amap = unflip_map(res["anomaly_map"].unsqueeze(1), name).squeeze(1)
             dino_map.add_(amap, alpha=w)
+            # Per-view image score from PatchCore (blends patch_max + cls_dist
+            # via cls_bank_weight), flipped back to be TTA-symmetric.
             pv_sum.add_(res["image_score"], alpha=w)
             wsum += w
-            if need_attn and "last_attn" in res:
+            if need_fg and "fg_saliency" in res:
                 try:
-                    last_attn = res["last_attn"]  # (V, Hp, Wp)
-                    fg_mask = foreground_from_last_attn(
-                        last_attn, out_size=self.cfg.input_size,
+                    sal = res["fg_saliency"]                   # (V, Hp, Wp)
+                    fg_mask = foreground_from_saliency(
+                        sal, out_size=self.cfg.input_size,
                         percentile=self.cfg.fg_percentile,
                         smooth_sigma=self.cfg.fg_smooth_sigma,
-                    ).to(amap.dtype)  # (V,1,H,W)
+                    ).to(amap.dtype)                           # (V,1,H,W)
                     if fg_mask.shape[0] != amap.shape[0]:
-                        # shape mismatch -- foreground not safe to apply
                         fg_mask = None
                 except Exception:
                     fg_mask = None
@@ -411,20 +409,10 @@ class CSIGAnomalyPipeline:
         dino_map.div_(wsum)
         pv = pv_sum.div_(wsum)
 
-        # ---- Foreground suppression (apply on the TTA-averaged map) ----
+        # ---- Foreground suppression: MAP ONLY, no score meddling ----
         if apply_fg and fg_mask is not None:
-            # fg_mask: (V,1,H,W), dino_map: (V,H,W)
             dino_map = apply_foreground(dino_map, fg_mask,
                                         lam=self.cfg.fg_bg_floor)
-            # Re-weight per-view image scores toward foreground max response
-            # (background suppression reduces pv for all-normal backgrounds,
-            # which otherwise dominate the average). We recompute pv using
-            # foreground-weighted max rather than raw amap max.
-            w_fg = fg_mask.squeeze(1).clamp(min=self.cfg.fg_bg_floor)  # (V,H,W)
-            pv_fg = (dino_map * w_fg).flatten(1).max(dim=1).values
-            # Blend original pv (calibrated on train) with fg-weighted pv
-            pv = 0.5 * pv + 0.5 * pv_fg
-            del w_fg, pv_fg
             del fg_mask
 
         img_raw = aggregate_image_scores(
