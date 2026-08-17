@@ -54,7 +54,7 @@ dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: false
+banks_on_gpu: true
 coreset_on_gpu: true
 device: "cuda"
 seed: 42

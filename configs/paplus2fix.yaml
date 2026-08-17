@@ -26,8 +26,8 @@ train_root: "CSIG/Train"
 test_root:  "CSIG/Test_A"
 out_dir:    "submission_paplus2fix"
 
-dinov2_model: "vitl14"
-dinov2_layers: [8, 9, 10, 11]
+dinov2_model: "vitg14"
+dinov2_layers: [12, 18, 24, 30]
 input_size: 448
 
 use_clip: true
@@ -92,7 +92,7 @@ dino_view_micro: 2
 knn_chunk: 512
 num_workers: 4
 use_amp: true
-banks_on_gpu: false
+banks_on_gpu: true
 coreset_on_gpu: true
 device: "cuda"
 seed: 42
