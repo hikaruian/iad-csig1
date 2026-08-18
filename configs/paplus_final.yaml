@@ -1,0 +1,137 @@
+# paplus_final.yaml -- Major fix. Diagnosis after 5 rounds of ablations:
+#
+# 1. The REAL bottleneck all along was COSET SIZE. With coreset_ratio=0.03
+#    and coreset_max=24576, per-class bank size was capped at 3072 patches
+#    because coreset_ratio*N_train_patches = 0.03*100*1024 = 3072 < 24576.
+#    That is ONLY 3% of the normal patches stored in the bank. 1-NN
+#    distance against such a sparse bank is dominated by random nearest-
+#    neighbour hits; the anomaly map is essentially high-frequency noise
+#    that percentile normalisation and gamma can never fully clean up,
+#    which is why P-AP was stuck at 0.28-0.30.
+#    Fix: coreset_ratio=0.10, coreset_max=49152 -> bank becomes 10240
+#    patches per class (10% coverage), kNN gets a dense normal manifold
+#    to measure against and FP noise collapses.
+#
+# 2. fg HARD-KILL did nothing in sotav2 (metrics identical to sota to 4
+#    decimal places). DINOv2-L/14 with register tokens makes CLS attend
+#    globally; CLS-patch final-norm cosine is ~0.9 everywhere on the
+#    image and cannot separate fg/bg. We turn fg OFF.
+#
+# 3. Multi-scale GEOMETRIC mean in sota was too aggressive -- it requires
+#    a response at ALL scales to survive, which kills small defects
+#    (they only appear at one scale) while background edge FPs survive
+#    because they DO appear at every scale. We switch to ARITHMETIC
+#    mean with a bias toward the canonical 448 scale (weight 0.6) and
+#    smaller weights for 392 and 518 (0.2 each) -- scales are
+#    complementary, not conjunctive.
+#
+# 4. Layer selection. Layers 8-11 (old paplus) are too shallow (raw
+#    texture), layers 16-22 (sota) are too semantic (edge blobs light up
+#    everywhere). The sweet spot for DINOv2-L/14 on industrial AD per
+#    AnomalyDINO/UnityAD/DINOv2-AD papers is (11, 14, 17, 20) -- late-mid
+#    blocks spanning texture through semantic.
+#
+# 5. n_neighbours=3 (k=3). k=1 is too sensitive to single outlier bank
+#    vectors when the bank is small; with a dense bank k=3 averages out
+#    the remaining noise. This is the PatchCore default and requires a
+#    dense enough bank to be beneficial.
+#
+# 6. TTA: keep h-flip only (v-flip proved unphysical for fixed-rig parts).
+#
+# 7. mv_aggregate: mean (keep sota fix -- robust_mean drops the single
+#    view where a defect is visible).
+#
+# Runtime impact:
+#   - Coreset build: +~2min (bank ~3.3x larger, still tiny vs GPU).
+#   - kNN inference: ~2-2.5x more comparisons per chunk but still O(N*M);
+#     knn_chunk=256 keeps activation bounded. Predict ~30-50 min on
+#     2xP100 (was 25-40 min). Well within Kaggle time limits.
+#   - Memory: 10240 * 1024 * 4 bytes = ~40 MB per class in fp32, <400 MB
+#     total for 50 classes (CPU resident; lazy GPU migration).
+#
+# Expected (conservative, based on P-AP jump that doubling PatchCore
+# bank density typically delivers on Real-IAD):
+#   I-AUROC: 0.90-0.93
+#   P-AUROC: 0.95+
+#   P-AP:    0.38 - 0.48
+#   Score:   78 - 88
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_final"
+
+dinov2_model: "vitl14"
+dinov2_layers: [11, 14, 17, 20]         # late-mid, balanced texture+semantic
+input_size: 448
+multi_scale: [392, 448, 518]
+multi_scale_weights: [0.2, 0.6, 0.2]   # arithmetic mean, bias to native scale
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+# ---- PatchCore: DENSE bank, k=3 NN, no spatial blur ----
+coreset_ratio: 0.10
+coreset_max: 49152
+neighbourhood_size: 1
+n_neighbours: 3                        # was 1; denser bank makes k=3 safe
+smooth_kernel: 5
+smooth_sigma: 1.6
+cls_bank_weight: 0.12
+coreset_batch: 64
+coreset_presample_ratio: 2.0           # 2x instead of 3x for denser FPS coverage
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+# ---- Foreground OFF (CLS cosine useless on DINOv2-L+registers) ----
+use_foreground_mask: false
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: false
+whitening_eps: 0.02
+
+# ---- CC cleanup tuned for denser map (fewer/weaker FPs expected) ----
+cc_min_area: 40
+cc_threshold: 0.40
+cc_kill_factor: 0.0
+
+mv_aggregate: "mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.12
+ens_clip_mask_weight: 0.0
+
+# ---- Calibration ----
+# With denser bank the background distribution tightens around a
+# lower distance, so lo_q can return to a moderate value; we keep it
+# high enough to zero out the bottom 70% of normal-patch distances.
+dino_map_lo_q: 0.70
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.8
+
+# ---- Runtime ----
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 1
+knn_chunk: 256                        # smaller chunks for larger bank
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

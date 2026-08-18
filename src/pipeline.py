@@ -104,15 +104,21 @@ class PipelineConfig:
     # of them simultaneously. Costs extra forward passes but we drop
     # v-flip/hv-flip from TTA to keep total runtime comparable.
     multi_scale: Tuple[int, ...] = (392, 448, 518)
+    # Per-scale weights for ARITHMETIC multi-scale fusion. If empty/None or
+    # length doesn't match multi_scale, falls back to geometric mean.
+    # Recommended: [0.2, 0.6, 0.2] -- bias to native 448 resolution.
+    multi_scale_weights: Tuple[float, ...] = ()
     use_clip: bool = True
     clip_model: str = "ViT-L-14-336"
     clip_pretrained: str = "openai"
 
     # ---- patchcore ----
-    coreset_ratio: float = 0.02
-    coreset_max: int = 16384
+    coreset_ratio: float = 0.10
+    coreset_max: int = 49152
     neighbourhood_size: int = 1    # 1 = no patch-level averaging (preserves sharp defects)
-    n_neighbours: int = 1          # use single nearest neighbour (k=1 best for localisation)
+    n_neighbours: int = 3          # k=3 NN (mean of 3 nearest) averages out single-bank-vector
+                                   # noise without smearing peaks. Standard PatchCore default.
+                                   # Bank needs to be dense (>=10% coverage) for k=3 to help.
     smooth_kernel: int = 7
     smooth_sigma: float = 2.5      # lighter Gaussian to avoid smearing small defects
     cls_bank_weight: float = 0.25
@@ -428,21 +434,45 @@ class CSIGAnomalyPipeline:
         Foreground (if requested) is only computed at the canonical scale
         orig pass to avoid redundant work.
         """
+        # Multi-scale TTA: run DINO+PatchCore at multiple input resolutions,
+        # resize each resulting anomaly map back to (input_size, input_size),
+        # and fuse them. Two modes supported via cfg.multi_scale_weights:
+        #   - None / all-ones: GEOMETRIC mean (product of scale maps)^(1/n).
+        #     Requires a response to appear at multiple scales to survive,
+        #     which is aggressive (kills scale-specific defects).
+        #   - list of positive floats (same length as cfg.multi_scale):
+        #     ARITHMETIC weighted mean. Scales are treated as complementary
+        #     evidence; weights are normalised to sum=1 internally. This is
+        #     the recommended setting. A canonical choice is
+        #     multi_scale=(392,448,518) with weights=(0.2,0.6,0.2) to bias
+        #     toward the native 448 resolution.
         scales = list(getattr(self.cfg, "multi_scale", ()) or ())
+        scale_weights = list(getattr(self.cfg, "multi_scale_weights", ()) or ())
         if not scales:
             scales = [self.cfg.input_size]
+        if not scale_weights or len(scale_weights) != len(scales):
+            scale_weights = [1.0] * len(scales)
+            fuse_mode = "geom"
+        else:
+            sw_sum = float(sum(scale_weights))
+            scale_weights = [float(w) / sw_sum for w in scale_weights]
+            fuse_mode = "arith"
+
         V = views.shape[0]
         H = W = self.cfg.input_size
 
-        # Accumulate log-anomaly across scales for geometric mean
-        log_map_sum = torch.zeros(V, H, W, device=views.device, dtype=torch.float32)
-        map_wsum = 0.0
-        # Per-view image score: weighted mean across scales, robust_mean across views
+        # Accumulator for scale fusion (reused for both geom and arith).
+        if fuse_mode == "geom":
+            log_map_sum = torch.zeros(V, H, W, device=views.device, dtype=torch.float32)
+            map_wsum = 0.0
+        else:
+            map_sum = torch.zeros(V, H, W, device=views.device, dtype=torch.float32)
+            map_wsum = 0.0
         pv_sum = torch.zeros(V, device=views.device, dtype=torch.float32)
         pv_wsum = 0.0
         fg_mask = None
 
-        for scale in scales:
+        for si, scale in enumerate(scales):
             # Resize views to this scale if needed
             if scale == H:
                 views_s = views
@@ -489,15 +519,22 @@ class CSIGAnomalyPipeline:
             if scale_w > 0:
                 scale_map.div_(scale_w)
                 scale_pv.div_(scale_w)
-            # Geometric mean accumulation via logs (avoid underflow with +1e-6 floor)
-            log_map_sum.add_(torch.log(scale_map.clamp(min=1e-6)))
-            map_wsum += 1.0
-            pv_sum.add_(scale_pv)
-            pv_wsum += 1.0
+            # Per-scale weight for cross-scale fusion.
+            sw = scale_weights[si]
+            if fuse_mode == "geom":
+                log_map_sum.add_(torch.log(scale_map.clamp(min=1e-6)), alpha=sw)
+            else:
+                map_sum.add_(scale_map, alpha=sw)
+            map_wsum += sw
+            pv_sum.add_(scale_pv, alpha=sw)
+            pv_wsum += sw
             del views_s, scale_map, scale_pv
 
-        dino_map = torch.exp(log_map_sum / max(1.0, map_wsum))
-        pv = pv_sum / max(1.0, pv_wsum)
+        if fuse_mode == "geom":
+            dino_map = torch.exp(log_map_sum / max(1e-6, map_wsum))
+        else:
+            dino_map = map_sum / max(1e-6, map_wsum)
+        pv = pv_sum / max(1e-6, pv_wsum)
 
         img_raw = aggregate_image_scores(
             pv.unsqueeze(0), strategy=self.cfg.mv_aggregate

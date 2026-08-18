@@ -132,4 +132,3 @@ banks_on_gpu: false
 coreset_on_gpu: true
 device: "cuda"
 seed: 42
-
