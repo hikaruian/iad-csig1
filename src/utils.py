@@ -142,17 +142,19 @@ def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path):
 # TTA helpers
 # ---------------------------------------------------------------------------
 def tta_flips(x: torch.Tensor):
-    """Yield (name, flipped_tensor) for the 4 flip augmentations.
-
-    Implemented as a generator so callers can process one augmentation at a
-    time without materialising all 4 copies of the tensor simultaneously.
-    This saves ~3×(V·3·H·W) elements of activation memory (~22 MB at 448px
-    fp32, more with larger inputs / fp32 maps).
+    """Yield (name, flipped_tensor) for H-flip TTA only.
+    
+    We deliberately DO NOT use vertical flip or hv-flip for industrial AD:
+    Real-IAD parts are mounted in a fixed rig orientation (top camera +
+    4 side cameras in clockwise order) and never appear upside-down.
+    v-flip produces OOD images that pollute the TTA average with
+    impossible viewpoints, hurting both image- and pixel-level scores.
+    h-flip is physically plausible (parts can be placed either way
+    relative to camera left/right, or equivalently the anomaly can
+    appear on either side of a symmetric part) and gives real gains.
     """
     yield ("orig", x)
     yield ("h",    torch.flip(x, dims=[-1]))
-    yield ("v",    torch.flip(x, dims=[-2]))
-    yield ("hv",   torch.flip(x, dims=[-2, -1]))
 
 
 def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:

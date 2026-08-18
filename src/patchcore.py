@@ -590,11 +590,18 @@ class MultiClassPatchCore:
     @torch.no_grad()
     def predict(self, cls: str, patch_feat: Tensor,
                 cls_feat: Tensor,
-                return_map: bool = True) -> Dict[str, Tensor]:
+                return_map: bool = True,
+                target_size: int | None = None) -> Dict[str, Tensor]:
         """
         patch_feat: (B, D, Hp, Wp) fused multi-layer patches
         cls_feat  : (B, D)         CLS tokens
-        Returns dict with image_scores (B,) and anomaly_map (B, high_res, high_res).
+        target_size: desired spatial size of the output anomaly map.
+            If None, defaults to self.high_res (canonical size, e.g. 448).
+            Pass the CURRENT input resolution when doing multi-scale
+            inference -- the upsampler will bilinearly resize the patch-
+            grid distance map to the spatial resolution of the INPUT
+            image, which is what multi-scale geometric mean requires.
+        Returns dict with image_scores (B,) and anomaly_map (B, T, T).
         """
         assert cls in self.banks, f"Class {cls} not in memory bank"
         bank = self.banks[cls]
@@ -623,11 +630,6 @@ class MultiClassPatchCore:
         flat_p = patch_feat.float().permute(0, 2, 3, 1).reshape(-1, D)
 
         # Apply per-dim whitening to PATCH features only.
-        # The CLS token vector is a global pooled descriptor in a different
-        # distribution (mean ≈ 0 after centering the patches, but its variance
-        # structure is unrelated to patch variance); whitening it with patch
-        # statistics destroys the CLS-prototype distance. We keep cls_dist
-        # in raw feature space.
         if bank.W is not None and bank.mean is not None:
             W_diag = bank.W
             mu = bank.mean
@@ -648,8 +650,9 @@ class MultiClassPatchCore:
                 kernel_size=self.neighbourhood_size, stride=1, padding=0
             )
 
-        # (2) Upsample to high-res
-        amap_hr = bilinear_upsample(amap, self.high_res)
+        # (2) Upsample to target resolution (dynamic for multi-scale)
+        T = int(target_size) if target_size is not None else int(self.high_res)
+        amap_hr = bilinear_upsample(amap, T)
         amap_hr = gaussian_smooth2d(amap_hr,
                                     kernel_size=self.smooth_kernel,
                                     sigma=self.smooth_sigma)

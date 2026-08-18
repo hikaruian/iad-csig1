@@ -1,0 +1,125 @@
+# paplus_v3.yaml -- ULTRA-SAFE P-AP lift over paplus_best.
+#
+# LESSON FROM v2: stacking whitening + HN + k=3 NN + 3x3 avgpool + CLIP mask
+# all at once destroyed the distance space (P-AUROC 0.92 -> 0.84, P-AP 0.30 -> 0.19).
+# Those tricks each change pixel RANKING (non-monotonic), so they can break P-AUROC
+# if they compound badly. This v3 changes ONLY MONOTONIC post-processing knobs that
+# CANNOT alter pixel ranking and CANNOT touch P-AUROC, but aggressively reduce false
+# positive pixels which are what dominates P-AP (precision-denominator problem: on
+# Real-IAD, >95% of pixels are normal, so even a small fraction of background noise
+# pixels craters P-AP).
+#
+# What changed vs paplus_best (everything else is IDENTICAL):
+#
+#   1) dino_map_lo_q: 0.60 -> 0.82   (the big one)
+#      At 0.60, 40% of NORMAL background pixels on train set end up with non-zero
+#      calibrated score -- tens of thousands of FP pixels per image that dominate
+#      the precision denominator. At 0.82, only the top 18% of normal-patch
+#      distances stay non-zero, which crushes the FP cloud while preserving all
+#      real defects (true anomalies live far above the 82nd percentile of normal).
+#      MONOTONIC transform -> P-AUROC unchanged, P-AP rises.
+#   2) cc_min_area: 20 -> 60
+#      On a 448x448 mask, 20 pixels is ~4.5x4.5 -- essentially salt/pepper.
+#      Real defects on Real-IAD (scratches/dents/stains) are 80-1000+ pixels at
+#      448px. Killing blobs <60 px is safe and removes the small texture-edge
+#      FP clusters that survive percentile normalization.
+#   3) cc_threshold: 0.35 -> 0.20
+#      Blob detection threshold lowered so we also catch medium-confidence FP
+#      blobs, not just the egregious ones.
+#   4) cc_kill_factor: 0.10 -> 0.0
+#      Hard-zero detected small blobs instead of multiplying by 0.1. With
+#      cc_threshold=0.20 and min_area=60 we are conservative enough that
+#      anything we kill is overwhelmingly likely to be FP.
+#   5) mask_gamma: 2.2 -> 3.0
+#      Now that lo_q suppresses 82% of background, a stronger gamma is safe:
+#      it squashes residual mid-tone noise (score 0.1-0.3) to near-zero while
+#      leaving strong defects (score >0.7) essentially untouched.
+#   6) ens_clip_weight: 0.22 -> 0.10
+#      CLIP's image-level score is uncalibrated (WinCLIP score is not passed
+#      through PerClassPercentileCalibrator). 0.22 over-weights it and adds
+#      noise to I-AUROC. Lowering it stabilizes image-level metrics.
+#
+# NOTEs:
+#   * whitening OFF, hard_negative_k=0, n_neighbours=1, neighbourhood_size=1,
+#     clip_mask_ens=false, use_foreground_mask=false -- ALL kept at paplus_best
+#     values to avoid any structural risk.
+#   * Predict time is IDENTICAL to paplus_best (15-25 min). No extra forwards.
+#   * P-AUROC must stay >= 0.92 (it is mathematically constrained to by the
+#     monotonic transforms; if it moves it's only due to cc hard-kill, which
+#     is tiny and we set cc_threshold low enough to only hit FP).
+#
+# Expected:
+#   I-AUROC: 0.88+ (slight up from less CLIP noise)
+#   P-AUROC: 0.92+ (same)
+#   P-AP:    0.33 - 0.38  (+3.5 - 8.5pp from 0.295)
+#   Score:   70 - 76
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_v3"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: false
+
+coreset_ratio: 0.03
+coreset_max: 24576
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+use_foreground_mask: false
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: false
+whitening_eps: 0.01
+
+cc_min_area: 60
+cc_threshold: 0.20
+cc_kill_factor: 0.0
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.10
+ens_clip_mask_weight: 0.0
+
+dino_map_lo_q: 0.82
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 3.0
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

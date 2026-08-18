@@ -146,7 +146,7 @@ def winclip_score(clip_model, patch_feat: torch.Tensor,
 
 
 def build_winclip_reference(clip_model, patch_feat_all: torch.Tensor,
-                            n_select: int = 2048) -> torch.Tensor:
+                            n_select: int = 4096) -> torch.Tensor:
     """
     Build a small normal-reference patch bank for one class via random
     selection (deterministic seed). Used by the WinCLIP branch.
