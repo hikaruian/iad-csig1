@@ -123,6 +123,11 @@ class PipelineConfig:
     # ---- ensemble ----
     ens_dino_weight: float = 0.75
     ens_clip_weight: float = 0.25
+    # Separate (lighter) weight for CLIP's MASK ensemble. CLIP patch maps
+    # carry useful semantic "defect-ness" prior but are spatially noisy; a
+    # small weight (~0.06-0.12) blends them in for free (CLIP encode_image
+    # already ran for the image score) without smearing DINO localisation.
+    ens_clip_mask_weight: float = 0.0
 
     # ---- normalisation percentiles for DINO anomaly maps (from train set) ----
     # Use median for lo so background stays at ~0; use a high hi so strong
@@ -683,13 +688,20 @@ class CSIGAnomalyPipeline:
         # ---- Ensemble (both maps are now in [0,1]) ----
         wd = self.cfg.ens_dino_weight
         wc_w = self.cfg.ens_clip_weight if self.clip is not None else 0.0
+        wc_m = float(getattr(self.cfg, "ens_clip_mask_weight", 0.0) or 0.0)
+        # Image score uses wc_w (typically 0.22).
         wt = wd + wc_w
-        if clip_map is not None and wc_w > 0:
-            ens_map = (dino_map_norm * wd + clip_map * wc_w) / wt
-        else:
-            ens_map = dino_map_norm
         ens_score = (dino_img_score * wd + clip_img_score * wc_w) / wt
         ens_score = ens_score.clamp(0.0, 1.0)
+        # Mask uses the lighter wc_m (default 0 = pure DINO, same as before).
+        # When clip_mask_ens=True and wc_m>0 we blend in CLIP's anomaly map
+        # with its own weight -- CLIP's map is already computed above, so
+        # this is effectively FREE (no extra forward pass).
+        if clip_map is not None and wc_m > 0:
+            wt_m = wd + wc_m
+            ens_map = (dino_map_norm * wd + clip_map * wc_m) / wt_m
+        else:
+            ens_map = dino_map_norm
         del dino_map_norm, clip_map, dino_img_score, clip_img_score
 
         # ---- Cross-view mask voting ----

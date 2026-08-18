@@ -171,4 +171,3 @@ def remove_small_components_torch(mask: torch.Tensor,
         mult[lab == li] = float(min_area_kill)
     out = torch.from_numpy((m_cpu * mult).astype(np.float32)).to(dev)
     return out.clamp_(0.0, 1.0)
-

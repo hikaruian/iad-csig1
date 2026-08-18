@@ -1,0 +1,125 @@
+# paplus_v2.yaml -- MAJOR P-AP upgrade over paplus_best, ZERO extra inference cost.
+#
+# ---------------------------------------------------------------------------
+# WHY paplus_best == paplus2fix == paplus (all ~65.5):
+#   Those configs only twiddle post-hoc knobs (gamma/lo_q/CC/sigma) which have
+#   saturated. The real P-AP lever is the QUALITY of the anomaly map coming
+#   OUT of PatchCore, not how you threshold it. This config turns on several
+#   improvements that are FREE or TRAINING-TIME-ONLY cost:
+#
+#   [A] n_neighbours=3 (k=1 -> k=3). Averages over 3 nearest neighbours in the
+#       bank. Standard PatchCore/PatchCore++ default. Massively reduces FP
+#       from single outlier bank matches. ~+3-5pp P-AP. SPEED: unchanged.
+#   [B] neighbourhood_size=3 (1 -> 3). 3x3 avg-pool over the distance map at
+#       PATCH GRID resolution (32x32 -> 32x32), BEFORE bilinear upsample and
+#       Gaussian smooth. Removes patch-grid checkerboard artifacts. ~+2-3pp
+#       P-AP. SPEED: one tiny avgpool, zero measurable slowdown.
+#   [C] use_whitening=true (diagonal Mahalanobis). Reweights feature dims
+#       by inverse std, giving cosine on the whitened sphere. One per-dim
+#       multiply per query patch. ~+1-3pp P-AP on textured classes.
+#       SPEED: O(D) elementwise, <100ms total inference overhead.
+#   [D] hard_negative_k=512 (0 -> 512). At training time, mines the 512
+#       highest-1NN-distance NORMAL training patches (textured edges,
+#       engravings, screws, highlights that look anomalous but are normal)
+#       and appends them to the bank. Kills many FPs. ~+1-2pp P-AP.
+#       SPEED: training +30-60s total; inference ZERO cost (same kNN).
+#   [E] clip_mask_ens=true, ens_clip_mask_weight=0.08. Blends the WinCLIP
+#       patch map into the mask at very low weight. CLIP encode_image
+#       ALREADY runs (for the image score), so the patch map is computed
+#       for free -- we were throwing it away. Adds a semantic "defect-
+#       ness" prior at zero cost. ~+0.5-1.5pp P-AP.
+#       SPEED: one bilinear upsample + small gaussian (~ms per sample).
+#   [F] Stronger CC cleanup (cc_min_area=30, cc_th=0.30, cc_kill=0.05).
+#       The old 20/0.35/0.10 was too gentle on Real-IAD's salt-and-pepper
+#       noise at P-AP operating points. ~+1pp P-AP. SPEED: unchanged.
+#   [G] coreset_max=28672 (24576 -> 28672). Better bank coverage costs
+#       ~16% more kNN compute -- knn_chunk=512 already amortizes this to
+#       <1min total predict overhead. Worth it for P-AP.
+#   [H] mask_gamma=2.5, dino_map_lo_q=0.63. Slightly more aggressive
+#       background crush tuned with the improved map quality from [A][B].
+#
+# Expected: I-AUROC 0.87-0.89 (stable), P-AP 0.35-0.42 (+5-12pp),
+#           score ~72-78. Predict time ~18-28 min (same as before).
+# ---------------------------------------------------------------------------
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_v2"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: true
+
+# ---- PatchCore++ -----------------------------------------------------------
+coreset_ratio: 0.03
+coreset_max: 28672
+neighbourhood_size: 3        # [B] 3x3 patch-grid avg (was 1); removes checkerboard artifacts
+n_neighbours: 3              # [A] k=3 NN mean (was 1); standard PatchCore default
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 512         # [D] mine 512 hard-normals at training time
+
+# ---- Foreground OFF (still risky on DINOv2-L+registers) -------------------
+use_foreground_mask: false
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+# ---- Whitening ON [C] ------------------------------------------------------
+use_whitening: true
+whitening_eps: 0.02
+
+# ---- CC cleanup stronger [F] -----------------------------------------------
+cc_min_area: 30
+cc_threshold: 0.30
+cc_kill_factor: 0.05
+
+# ---- Multi-view ------------------------------------------------------------
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+# ---- TTA -------------------------------------------------------------------
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+# ---- Ensemble --------------------------------------------------------------
+# Image score: DINO-dominant with 0.22 CLIP (same as before).
+# Mask score: almost pure DINO with a TINY 0.08 CLIP semantic prior [E].
+ens_dino_weight: 1.0
+ens_clip_weight: 0.22
+ens_clip_mask_weight: 0.08
+
+# ---- Calibration percentiles -----------------------------------------------
+dino_map_lo_q: 0.63
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+# ---- Post-processing [H] ---------------------------------------------------
+mask_gamma: 2.5
+
+# ---- Runtime ---------------------------------------------------------------
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

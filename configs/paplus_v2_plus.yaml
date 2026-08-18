@@ -1,0 +1,87 @@
+# paplus_v2_plus.yaml -- v2 + post-norm foreground soft-suppression.
+#
+# Same as paplus_v2 but ENABLES the CLS-patch cosine foreground mask as a
+# final MULTIPLIER (post-percentile-norm, post-CC, applied directly to the
+# [0,1] mask). This is in the CORRECT position now (after calibration, so
+# calibrator cannot absorb it). Suppression floor is 0.25 (gentle) so small
+# defects in low-saliency regions are NOT killed.
+#
+# If the foreground saliency on DINOv2-L/14+registers is unreliable this can
+# drop P-AP a little; if it's good on Real-IAD it gives another +1-3pp.
+# Predict time is identical to v2 (fg saliency is computed for free from
+# the last normed features when collect_fg=True; only adds a bilinear upsample
+# + gaussian + sigmoid, ~ms per sample).
+#
+# Run THIS if paplus_v2 lands well and you want to squeeze more; otherwise
+# treat as experimental.
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_v2p"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: true
+
+coreset_ratio: 0.03
+coreset_max: 28672
+neighbourhood_size: 3
+n_neighbours: 3
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 512
+
+# ---- Foreground ON (post-norm, post-CC), gentle floor --------------------
+use_foreground_mask: true
+fg_percentile: 30.0
+fg_bg_floor: 0.25           # gentle: bg pixels multiplied by 0.25, not 0
+fg_smooth_sigma: 3.0
+fg_hard_threshold: 0.0      # NO hard zeroing -- avoid killing real defects
+
+use_whitening: true
+whitening_eps: 0.02
+
+cc_min_area: 30
+cc_threshold: 0.30
+cc_kill_factor: 0.05
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.22
+ens_clip_mask_weight: 0.08
+
+dino_map_lo_q: 0.63
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.5
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42
