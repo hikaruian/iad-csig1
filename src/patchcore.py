@@ -657,14 +657,15 @@ class MultiClassPatchCore:
                                     kernel_size=self.smooth_kernel,
                                     sigma=self.smooth_sigma)
 
-        # (3) Image score: weighted blend of (a) patch-level max distance
-        # and (b) CLS-token distance to the class prototype.
-        # Both terms are in the SAME scale ([0,2]) because features
-        # and prototype are L2-normalised (dot = cos sim ∈ [-1,1]).
-        patch_score = amap_hr.flatten(1).max(dim=1).values  # (B,)
+        # (3) Image score: weighted blend of (a) robust patch-level max
+        # (99.5th percentile, less sensitive to single-pixel outliers than
+        # the strict max used in the baseline) and (b) CLS-token distance
+        # to the class prototype. Both terms are in [0,2] because features
+        # and prototype are L2-normalised.
+        patch_score = amap_hr.flatten(1).quantile(0.995, dim=1)  # (B,)
         proto = bank.cls_prototype
         if proto.dim() == 1:
-            proto = proto.unsqueeze(-1)  # (D,1)
+            proto = proto.unsqueeze(-1)
         else:
             proto = proto.reshape(-1, 1)
         if proto.dtype != torch.float32:
@@ -675,7 +676,8 @@ class MultiClassPatchCore:
 
         out = {
             "image_score": img_score,        # (B,)
-            "anomaly_map": amap_hr[:, 0],    # (B, high_res, high_res)
+            "anomaly_map": amap_hr[:, 0],    # (B, T, T)
+            "cls_dist": cls_dist,            # (B,) for CLS-gated fusion
         }
 
         if return_map:

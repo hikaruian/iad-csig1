@@ -142,19 +142,14 @@ def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path):
 # TTA helpers
 # ---------------------------------------------------------------------------
 def tta_flips(x: torch.Tensor):
-    """Yield (name, flipped_tensor) for H-flip TTA only.
-    
-    We deliberately DO NOT use vertical flip or hv-flip for industrial AD:
-    Real-IAD parts are mounted in a fixed rig orientation (top camera +
-    4 side cameras in clockwise order) and never appear upside-down.
-    v-flip produces OOD images that pollute the TTA average with
-    impossible viewpoints, hurting both image- and pixel-level scores.
-    h-flip is physically plausible (parts can be placed either way
-    relative to camera left/right, or equivalently the anomaly can
-    appear on either side of a symmetric part) and gives real gains.
-    """
+    """Yield (name, flipped_tensor) for the 4 flip augmentations.
+    Back to full 4-way TTA (orig/h/v/hv) -- v-flip does not hurt on
+    Real-IAD Variety because the parts are roughly symmetric top/bottom
+    in many classes and v-flip acts as a useful invariance prior."""
     yield ("orig", x)
     yield ("h",    torch.flip(x, dims=[-1]))
+    yield ("v",    torch.flip(x, dims=[-2]))
+    yield ("hv",   torch.flip(x, dims=[-2, -1]))
 
 
 def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:

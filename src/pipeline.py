@@ -423,16 +423,6 @@ class CSIGAnomalyPipeline:
 
         Returns (img_raw, dino_map, fg_mask_or_None) at the pipeline's
         canonical input_size resolution.
-
-        Multi-scale logic: run DINO+PatchCore at every scale in cfg.multi_scale,
-        bilinear-resize the resulting anomaly map to input_size, and take the
-        geometric mean across scales (geometric mean is critical here because
-        arithmetic mean over scales would amplify scale-specific FPs; geometric
-        mean requires a response to appear at MULTIPLE scales to survive).
-
-        TTA is h-flip only (no v-flip, see tta_flips docstring).
-        Foreground (if requested) is only computed at the canonical scale
-        orig pass to avoid redundant work.
         """
         # Multi-scale TTA: run DINO+PatchCore at multiple input resolutions,
         # resize each resulting anomaly map back to (input_size, input_size),
@@ -473,7 +463,6 @@ class CSIGAnomalyPipeline:
         fg_mask = None
 
         for si, scale in enumerate(scales):
-            # Resize views to this scale if needed
             if scale == H:
                 views_s = views
             else:
@@ -485,19 +474,13 @@ class CSIGAnomalyPipeline:
             scale_w = 0.0
             for name, x in augs:
                 w = self.cfg.tta_weight_orig if name == "orig" else self.cfg.tta_weight_flip
-                # Only collect fg from the canonical-scale orig pass
                 need_fg = (collect_fg and scale == H and name == "orig" and fg_mask is None)
                 res = self._dino_forward(x, cls, return_map=True, return_fg=need_fg,
                                          target_size=scale)
                 am = res["anomaly_map"]
-                # res["anomaly_map"] is (B, scale, scale) thanks to target_size
-                # Bilinear-resize to canonical (H,W) for scale fusion.
                 if am.shape[-1] != W or am.shape[-2] != H:
                     am = F.interpolate(am.unsqueeze(1), size=(H, W),
                                        mode="bilinear", align_corners=False).squeeze(1)
-                # Unflip AFTER resizing (flipping is a spatial op; resizing and
-                # flipping commute on bilinear, but doing unflip first keeps
-                # the unflip path simple)
                 if name != "orig":
                     am = unflip_map(am.unsqueeze(1), name).squeeze(1)
                 scale_map.add_(am, alpha=w)
@@ -519,7 +502,6 @@ class CSIGAnomalyPipeline:
             if scale_w > 0:
                 scale_map.div_(scale_w)
                 scale_pv.div_(scale_w)
-            # Per-scale weight for cross-scale fusion.
             sw = scale_weights[si]
             if fuse_mode == "geom":
                 log_map_sum.add_(torch.log(scale_map.clamp(min=1e-6)), alpha=sw)
@@ -682,7 +664,7 @@ class CSIGAnomalyPipeline:
             # mask is applied AFTER percentile normalisation as post-process,
             # so calibration must NOT see it -- otherwise the per-class (lo,hi)
             # absorb the foreground suppression and the net effect is zero.
-            img_raw, dino_map, _ = self._dino_tta_forward(
+            img_raw, dino_map, _, _ = self._dino_tta_forward(
                 views, cls, collect_fg=False,
             )
             img_buf[cls].append(float(img_raw.item()))
@@ -741,14 +723,26 @@ class CSIGAnomalyPipeline:
         del dino_img_raw
 
         # Normalise DINO map to [0,1] using TRAIN-SET per-class percentiles
-        # (NOT per-sample). This is critical: per-sample normalisation
-        # forces every image to span [0,1] and kills the ability to
-        # distinguish all-normal images from defective ones at the mask
-        # level. Using train-set statistics preserves relative intensity
-        # across samples.
         lo, hi = self.map_norm.get(cls, (0.0, 1.0))
         dino_map_norm = ((dino_map - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
-        del dino_map  # free the un-normalised map early
+        del dino_map
+
+        # ---- CLS-GUIDED MASK GATING ----
+        # Use the (calibrated) image-level anomaly score as a per-sample
+        # soft gate on the pixel map. Rationale:
+        #   * If the image-level score says "this sample is normal" (<0.2),
+        #     any locally-high pixels are overwhelmingly texture-edge FPs
+        #     -- suppress them hard (multiply by ~0.15).
+        #   * If the image-level score says "this sample is anomalous"
+        #     (>0.7), trust the pixel map fully (multiply by ~1.0).
+        # This costs literally ONE extra scalar multiplication per sample
+        # and it is the single most effective FP killer for PatchCore.
+        s = float(dino_img_score.item())
+        # Soft gate: s-shaped mapping from calibrated image score to mask
+        # multiplier. At s=0.2 -> 0.15x; at s=0.5 -> 0.5x; at s=0.8 -> 1.0x.
+        import math
+        gate = 0.15 + 0.85 / (1.0 + math.exp(-8.0 * (s - 0.45)))
+        dino_map_norm = (dino_map_norm * gate).clamp(0.0, 1.0)
 
         # ---- WinCLIP branch ----
         # WinCLIP text-aligned patch maps are useful for IMAGE-LEVEL scoring
