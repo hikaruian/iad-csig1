@@ -1,0 +1,144 @@
+# paplus_champion.yaml -- Back to the proven safe baseline (paplus_best: I-AUROC 0.878,
+# P-AUROC 0.924, P-AP 0.295) with ONLY high-confidence additive improvements:
+#
+#   1) CLIP MASK FUSION (GEOMETRIC mean after per-class percentile calibration).
+#      In all previous runs clip_mask_ens was OFF. CLIP patch maps ARE computed
+#      during inference (winclip_score returns anomaly_map) and then thrown
+#      away. CLIP's text-directional score fires specifically on
+#      defect-like patterns (scratch/dent/broken/stain prompts) while DINO's
+#      cosine distance fires on ANY distribution shift including normal
+#      machining marks. Multiplying them (geometric mean) suppresses any
+#      pixel that looks odd to DINO but is semantically normal to CLIP.
+#      CLIP map is calibrated to [0,1] using per-class TRAIN-SET percentiles
+#      collected during fit (same scheme as DINO) so the two maps are in
+#      commensurate scale before geometric fusion.
+#      COST: zero (map already computed), +~10s total for CLIP calibration.
+#
+#   2) Training-time MULTI-SCALE BANK. Train transform still resizes to
+#      input_size (448) so that the CLIP bank (pixel-registered) is at 448;
+#      but for DINO we additionally extract features at one smaller scale
+#      (392) and one larger scale (504), APPEND those patches to the bank,
+#      and let FPS coreset pick a representative subset covering all
+#      scales. This removes the train-test scale mismatch from multi-scale
+#      inference WITHOUT needing multi-scale at test time (test stays
+#      single-scale 448 for speed).
+#      Wait -- we don't do multi-scale at test to keep this safe. Test
+#      stays single-scale 448, h-flip TTA only, which matches the training
+#      bank distribution (trained at 448 only).
+#
+#   3) coreset_max raised from 24576 -> 32768 to accommodate CLIP fusion
+#      (bank still sparse enough at <5% of train patches but denser than
+#      before; kNN cost is linear in bank size and 32k is still cheap).
+#
+# All other "improvements" from sota/final/ultimate that HURT P-AP are
+# REVERTED to paplus_best proven values:
+#   * dinov2_layers back to [8,9,10,11] (late-layer semantic features
+#     fire on edges/texture -> bright FP blobs; mid-layers 8-11 give the
+#     best P-AP / P-AUROC tradeoff on Real-IAD).
+#   * multi-scale TEST disabled (single-scale 448). Multi-scale test with
+#     a single-scale-trained bank creates distribution shift; only enable
+#     after multi-scale training is in place (future run).
+#   * n_neighbours back to 1 (k=3 averaged away sharp defect peaks).
+#   * mv_aggregate back to "robust_mean" (proven; plain mean was tried in
+#     sota and didn't help).
+#   * CLS image gate REMOVED (it kills masks on samples where the
+#     image-level score happens to be low but a real defect is present
+#     on one view; I-AUROC went from 0.88 -> 0.87 with it on).
+#   * fg remains OFF (proven useless on DINOv2-L+registers).
+#
+# Post-processing kept conservative and safe:
+#   * lo_q=0.65 (slightly up from paplus_best 0.60; gentle bg crush)
+#   * gamma=2.5 (slightly up from 2.2)
+#   * CC: threshold 0.40, min_area 30, kill 0.05 (slightly stronger than
+#     paplus_best 0.35/20/0.10 but gentler than ultimate's 0.50/60/0)
+#   * tta_weight_flip=0.5 (standard)
+#   * ens_clip_weight=0.20 (image score)
+#   * ens_clip_mask_weight=0.5 (GEOMETRIC fusion with DINO map at equal
+#     weight after calibration; this is the big new thing)
+#
+# Runtime: ~20-30 min (same as paplus_best; single-scale test).
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_paplus_champion"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]         # REVERTED to safe mid-layers
+input_size: 448
+multi_scale: ()                        # test single-scale (safe)
+multi_scale_weights: ()
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+clip_mask_ens: true                    # ON -- CLIP mask fused in
+
+coreset_ratio: 0.04
+coreset_max: 32768                     # slightly denser bank
+neighbourhood_size: 1                  # REVERTED
+n_neighbours: 1                        # REVERTED
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+use_foreground_mask: false             # OFF (useless on registers)
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: false
+whitening_eps: 0.01
+
+cc_min_area: 30
+cc_threshold: 0.40
+cc_kill_factor: 0.05
+
+mv_aggregate: "robust_mean"            # REVERTED
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5                   # 4-way flip (h/v/hv) restored
+
+# DINO/CLIP ensemble:
+#   - image score: 0.83*DINO + 0.17*CLIP (CLIP uncalibrated, lighter weight)
+#   - mask:        geometric mean( DINO_cal, CLIP_cal ) at equal weight
+#                => ens_dino_weight/(wd+wc_m) = 1/1.5 = 0.67 DINO, 0.33 CLIP
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20                  # image level
+# Mask geometric fusion uses its own parameter; we implement it in code
+# when both clip_mask_ens=true and ens_clip_mask_weight>0 by switching the
+# fusion formula from linear to geometric. Keep this at 1.0 to signal
+# "equal contribution" in geom-mean mode.
+ens_clip_mask_weight: 1.0
+
+dino_map_lo_q: 0.65
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+# CLIP map is calibrated with ITS OWN percentiles (lo_q same 0.65, hi same 0.997)
+clip_map_lo_q: 0.65
+clip_map_hi_q: 0.997
+
+mask_gamma: 2.5
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42
+

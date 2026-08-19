@@ -275,6 +275,13 @@ class CSIGAnomalyPipeline:
         # "per-sample normalisation always flags something" pitfall.
         self.map_norm: Dict[str, Tuple[float, float]] = {}
 
+        # Calibrator for CLIP patch maps (per-class) -- same train-set percentile
+        # scheme as DINO, so CLIP map is also in [0,1] with comparable scale
+        # before we fuse with DINO. CLIP text-direction distance has very
+        # different absolute magnitude from DINO 1-NN cosine distance; without
+        # this calibration a linear blend is meaningless.
+        self.clip_map_norm: Dict[str, Tuple[float, float]] = {}
+
         self.clip_refs: Dict[str, torch.Tensor] = {}
         # Cross-view attention is NOT used in the default scoring formula
         # (mean-pooled CLS is more stable); only allocate if explicitly
@@ -647,6 +654,7 @@ class CSIGAnomalyPipeline:
 
         img_buf: Dict[str, List[float]] = {c: [] for c in self.classes}
         map_pix_buf: Dict[str, List[torch.Tensor]] = {c: [] for c in self.classes}
+        clip_map_pix_buf: Dict[str, List[torch.Tensor]] = {c: [] for c in self.classes}
 
         prev_cls: Optional[str] = None
 
@@ -654,25 +662,54 @@ class CSIGAnomalyPipeline:
             views = self._move_input(batch["views"].squeeze(0))  # (V,3,H,W)
             cls = batch["cls_name"][0]
 
-            # Lazy-migrate the current class' bank to GPU; evict the previous.
             if cls != prev_cls:
                 if prev_cls is not None:
                     self._evict_bank_to_cpu(prev_cls)
                 self._ensure_bank_on_device(cls, banks_mode)
                 prev_cls = cls
 
-            # Calibration runs on RAW (pre-foreground) maps.  The foreground
-            # mask is applied AFTER percentile normalisation as post-process,
-            # so calibration must NOT see it -- otherwise the per-class (lo,hi)
-            # absorb the foreground suppression and the net effect is zero.
             img_raw, dino_map, _ = self._dino_tta_forward(
                 views, cls, collect_fg=False,
             )
             img_buf[cls].append(float(img_raw.item()))
-            # Subsample map pixels to keep CPU memory low.
             flat = dino_map.detach().reshape(-1).cpu()
             idx = torch.randperm(flat.shape[0], generator=g_cal)[:5000]
             map_pix_buf[cls].append(flat[idx])
+
+            # Also collect CLIP raw anomaly map pixels for CLIP mask calibration
+            if self.clip is not None:
+                try:
+                    views_clip_c = _imagenet_to_clip(views)
+                    ref = self.clip_refs.get(cls, None)
+                    if ref is not None and ref.device != views_clip_c.device:
+                        ref = ref.to(views_clip_c.device)
+                    all_p_c, all_c_c = [], []
+                    micro = max(1, int(self.cfg.clip_batch_size))
+                    for ii in range(0, views_clip_c.shape[0], micro):
+                        sub_c = views_clip_c[ii:ii+micro]
+                        with self._autocast_ctx():
+                            cout_c = self.clip.encode_image(sub_c)
+                        all_p_c.append(cout_c["patch"].float())
+                        all_c_c.append(cout_c["cls"].float())
+                        del sub_c, cout_c
+                    c_p = torch.cat(all_p_c, dim=0)
+                    c_c = torch.cat(all_c_c, dim=0)
+                    del all_p_c, all_c_c
+                    wc_c = winclip_score(self.clip, c_p, c_c, cls,
+                                        reference_patches=ref, alpha=0.5)
+                    cm_c = wc_c["anomaly_map"].detach()  # (V, Hp_c, Wp_c)
+                    # Bilinear upsample to 448 for consistent pixel sampling
+                    if cm_c.shape[-1] != self.cfg.input_size or cm_c.shape[-2] != self.cfg.input_size:
+                        cm_c = F.interpolate(cm_c.unsqueeze(1),
+                                             size=(self.cfg.input_size, self.cfg.input_size),
+                                             mode="bilinear", align_corners=False).squeeze(1)
+                    flat_c = cm_c.reshape(-1).cpu()
+                    idx_c = torch.randperm(flat_c.shape[0], generator=g_cal)[:2000]
+                    clip_map_pix_buf[cls].append(flat_c[idx_c])
+                    del c_p, c_c, wc_c, cm_c, flat_c, views_clip_c
+                except Exception:
+                    pass
+
             del views, dino_map, flat
         # Evict last class
         if prev_cls is not None:
@@ -693,6 +730,20 @@ class CSIGAnomalyPipeline:
             if hi - lo < 1e-6:
                 hi = lo + 1e-3
             self.map_norm[c] = (lo, hi)
+
+        # Fit CLIP map normalisation percentiles per class (if clip_mask_ens on)
+        clo_q = float(getattr(self.cfg, "clip_map_lo_q", 0.65))
+        chi_q = float(getattr(self.cfg, "clip_map_hi_q", 0.997))
+        for c in self.classes:
+            if c in clip_map_pix_buf and len(clip_map_pix_buf[c]) > 0:
+                all_pix = torch.cat(clip_map_pix_buf[c])
+                clo = float(torch.quantile(all_pix, clo_q).item())
+                chi = float(torch.quantile(all_pix, chi_q).item())
+                if chi - clo < 1e-6:
+                    chi = clo + 1e-3
+                self.clip_map_norm[c] = (clo, chi)
+            else:
+                self.clip_map_norm[c] = (0.0, 1.0)
 
         print("[fit] Calibration done. Example stats:")
         for c in self.classes[:3]:
@@ -728,22 +779,6 @@ class CSIGAnomalyPipeline:
         dino_map_norm = ((dino_map - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
         del dino_map
 
-        # ---- CLS-GUIDED MASK GATING ----
-        # Use the (calibrated) image-level anomaly score as a per-sample
-        # soft gate on the pixel map. Rationale:
-        #   * If the image-level score says "this sample is normal" (<0.2),
-        #     any locally-high pixels are overwhelmingly texture-edge FPs
-        #     -- suppress them hard (multiply by ~0.15).
-        #   * If the image-level score says "this sample is anomalous"
-        #     (>0.7), trust the pixel map fully (multiply by ~1.0).
-        # This costs literally ONE extra scalar multiplication per sample
-        # and it is the single most effective FP killer for PatchCore.
-        s = float(dino_img_score.item())
-        # Soft gate: s-shaped mapping from calibrated image score to mask
-        # multiplier. At s=0.2 -> 0.15x; at s=0.5 -> 0.5x; at s=0.8 -> 1.0x.
-        gate = 0.15 + 0.85 / (1.0 + math.exp(-8.0 * (s - 0.45)))
-        dino_map_norm = (dino_map_norm * gate).clamp(0.0, 1.0)
-
         # ---- WinCLIP branch ----
         # WinCLIP text-aligned patch maps are useful for IMAGE-LEVEL scoring
         # (they add semantic "defect-ness" signal) but are too noisy for pixel
@@ -776,7 +811,14 @@ class CSIGAnomalyPipeline:
                 cm = wc["anomaly_map"].unsqueeze(1)
                 cm = bilinear_upsample(cm, self.cfg.input_size)
                 cm = gaussian_smooth2d(cm, kernel_size=7, sigma=3.0)
-                clip_map = cm[:, 0].clamp(0.0, 1.0)
+                cm = cm[:, 0]  # (V,H,W) raw WinCLIP distance
+                # Calibrate CLIP map to [0,1] using PER-CLASS train-set percentiles
+                # (collected during fit). Same scheme as DINO so both maps are
+                # on commensurate scale before geometric fusion.
+                clo = float(getattr(self.cfg, "clip_map_lo_q", 0.65))
+                chi = float(getattr(self.cfg, "clip_map_hi_q", 0.997))
+                c_lo, c_hi = self.clip_map_norm.get(cls, (0.0, 1.0))
+                clip_map = ((cm - c_lo) / (c_hi - c_lo + 1e-6)).clamp(0.0, 1.0)
             else:
                 clip_map = None
             del c_patch, c_cls, wc
@@ -785,17 +827,22 @@ class CSIGAnomalyPipeline:
         wd = self.cfg.ens_dino_weight
         wc_w = self.cfg.ens_clip_weight if self.clip is not None else 0.0
         wc_m = float(getattr(self.cfg, "ens_clip_mask_weight", 0.0) or 0.0)
-        # Image score uses wc_w (typically 0.22).
+        # Image score blend (linear, same as before)
         wt = wd + wc_w
         ens_score = (dino_img_score * wd + clip_img_score * wc_w) / wt
         ens_score = ens_score.clamp(0.0, 1.0)
-        # Mask uses the lighter wc_m (default 0 = pure DINO, same as before).
-        # When clip_mask_ens=True and wc_m>0 we blend in CLIP's anomaly map
-        # with its own weight -- CLIP's map is already computed above, so
-        # this is effectively FREE (no extra forward pass).
+        # Mask fusion: GEOMETRIC mean with CLIP map when enabled (kills FP that
+        # DINO thinks is anomalous but CLIP recognizes as normal texture).
         if clip_map is not None and wc_m > 0:
-            wt_m = wd + wc_m
-            ens_map = (dino_map_norm * wd + clip_map * wc_m) / wt_m
+            # Geometric mean: sqrt(D * C) when wc_m=1.0 (equal weight).
+            # eps 1e-4 prevents true zeros from nuking everything.
+            eps = 1e-4
+            d_safe = dino_map_norm.clamp(min=eps)
+            c_safe = clip_map.clamp(min=eps)
+            # Weighted geometric mean: d^(wd/(wd+wc_m)) * c^(wc_m/(wd+wc_m))
+            pw_d = wd / (wd + wc_m)
+            pw_c = wc_m / (wd + wc_m)
+            ens_map = (d_safe.pow(pw_d) * c_safe.pow(pw_c)).clamp(0.0, 1.0)
         else:
             ens_map = dino_map_norm
         del dino_map_norm, clip_map, dino_img_score, clip_img_score
@@ -965,3 +1012,4 @@ class CSIGAnomalyPipeline:
         out_np = cmap.clamp(0, 1).cpu().numpy()
         del c_patch, c_cls, wc, cm, cmap, img_score
         return cal_score, out_np
+
