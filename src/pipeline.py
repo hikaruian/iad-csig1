@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -664,7 +665,7 @@ class CSIGAnomalyPipeline:
             # mask is applied AFTER percentile normalisation as post-process,
             # so calibration must NOT see it -- otherwise the per-class (lo,hi)
             # absorb the foreground suppression and the net effect is zero.
-            img_raw, dino_map, _, _ = self._dino_tta_forward(
+            img_raw, dino_map, _ = self._dino_tta_forward(
                 views, cls, collect_fg=False,
             )
             img_buf[cls].append(float(img_raw.item()))
@@ -740,7 +741,6 @@ class CSIGAnomalyPipeline:
         s = float(dino_img_score.item())
         # Soft gate: s-shaped mapping from calibrated image score to mask
         # multiplier. At s=0.2 -> 0.15x; at s=0.5 -> 0.5x; at s=0.8 -> 1.0x.
-        import math
         gate = 0.15 + 0.85 / (1.0 + math.exp(-8.0 * (s - 0.45)))
         dino_map_norm = (dino_map_norm * gate).clamp(0.0, 1.0)
 
