@@ -444,8 +444,15 @@ class CSIGAnomalyPipeline:
         #     the recommended setting. A canonical choice is
         #     multi_scale=(392,448,518) with weights=(0.2,0.6,0.2) to bias
         #     toward the native 448 resolution.
-        scales = list(getattr(self.cfg, "multi_scale", ()) or ())
-        scale_weights = list(getattr(self.cfg, "multi_scale_weights", ()) or ())
+        scales_cfg = getattr(self.cfg, "multi_scale", ()) or ()
+        # Accept tuple/list/None; guard against YAML "()" being parsed as a string
+        if not isinstance(scales_cfg, (list, tuple)):
+            scales_cfg = ()
+        scales = [int(s) for s in scales_cfg] if scales_cfg else []
+        sw_cfg = getattr(self.cfg, "multi_scale_weights", ()) or ()
+        if not isinstance(sw_cfg, (list, tuple)):
+            sw_cfg = ()
+        scale_weights = [float(w) for w in sw_cfg] if sw_cfg else []
         if not scales:
             scales = [self.cfg.input_size]
         if not scale_weights or len(scale_weights) != len(scales):

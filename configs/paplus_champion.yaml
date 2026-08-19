@@ -65,8 +65,8 @@ out_dir:    "submission_paplus_champion"
 dinov2_model: "vitl14"
 dinov2_layers: [8, 9, 10, 11]         # REVERTED to safe mid-layers
 input_size: 448
-multi_scale: ()                        # test single-scale (safe)
-multi_scale_weights: ()
+multi_scale: []                       # test single-scale (safe)
+multi_scale_weights: []
 
 use_clip: true
 clip_model: "ViT-L-14-336"
