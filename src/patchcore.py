@@ -298,9 +298,11 @@ class MultiClassPatchCore:
                  coreset_batch: int = 64,
                  coreset_presample_ratio: float = 3.0,
                  use_whitening: bool = False,
-                 whitening_eps: float = 0.01):
+                 whitening_eps: float = 0.01,
+                 coreset_method: str = "fps"):
         self.coreset_ratio = coreset_ratio
         self.coreset_max = coreset_max
+        self.coreset_method = str(coreset_method).lower()
         self.neighbourhood_size = neighbourhood_size
         self.n_neighbours = n_neighbours
         self.high_res = high_res
@@ -401,11 +403,21 @@ class MultiClassPatchCore:
                 self.coreset_max,
                 max(1024, int(self.coreset_ratio * all_feats.shape[0])),
             )
-            bank = greedy_coreset(all_feats, n_select=n_select,
-                                  random_proj_dim=self.random_proj_dim,
-                                  device=compute_dev,
-                                  batch_size=self.coreset_batch,
-                                  presample_ratio=self.coreset_presample_ratio)
+            n_select = min(n_select, all_feats.shape[0])
+            if self.coreset_method == "random":
+                # Deterministic uniform random subsample. Unbiased: covers
+                # dense modes of the normal distribution (where FPs come
+                # from) rather than preferring boundary/outlier points
+                # like FPS does. Often gives +P-AP in competitions.
+                g_r = torch.Generator(device="cpu").manual_seed(0)
+                idx = torch.randperm(all_feats.shape[0], generator=g_r)[:n_select]
+                bank = all_feats.index_select(0, idx).contiguous()
+            else:
+                bank = greedy_coreset(all_feats, n_select=n_select,
+                                      random_proj_dim=self.random_proj_dim,
+                                      device=compute_dev,
+                                      batch_size=self.coreset_batch,
+                                      presample_ratio=self.coreset_presample_ratio)
             bank = F.normalize(bank.float(), dim=-1).contiguous()
 
             # ---- Hard-negative normal mining ----

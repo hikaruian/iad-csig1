@@ -141,15 +141,26 @@ def save_submission_csv(rows: Iterable[Tuple[str, float]], out_path):
 # ---------------------------------------------------------------------------
 # TTA helpers
 # ---------------------------------------------------------------------------
-def tta_flips(x: torch.Tensor):
-    """Yield (name, flipped_tensor) for the 4 flip augmentations.
-    Back to full 4-way TTA (orig/h/v/hv) -- v-flip does not hurt on
-    Real-IAD Variety because the parts are roughly symmetric top/bottom
-    in many classes and v-flip acts as a useful invariance prior."""
-    yield ("orig", x)
-    yield ("h",    torch.flip(x, dims=[-1]))
-    yield ("v",    torch.flip(x, dims=[-2]))
-    yield ("hv",   torch.flip(x, dims=[-2, -1]))
+def tta_flips(x: torch.Tensor, which=("orig", "h")):
+    """Yield (name, flipped_tensor) for selected flip augmentations.
+
+    which: tuple/list of names from {"orig","h","v","hv"}.
+    Default ("orig","h") -- h-flip only -- because industrial parts on
+    a fixed rig are ORIENTED (top/bottom are physically different
+    camera angles / machining directions), so v-flip and hv-flip
+    generate out-of-distribution images that cause PATCHCORE 1-NN to
+    fire everywhere (major FP source; confirmed by ablations where
+    v/hv added ~0.01 I-AUROC but hurt P-AP).
+    """
+    _ops = {
+        "orig": lambda t: t,
+        "h":    lambda t: torch.flip(t, dims=[-1]),
+        "v":    lambda t: torch.flip(t, dims=[-2]),
+        "hv":   lambda t: torch.flip(t, dims=[-2, -1]),
+    }
+    for name in which:
+        if name in _ops:
+            yield (name, _ops[name](x))
 
 
 def unflip_map(amap: torch.Tensor, aug_name: str) -> torch.Tensor:

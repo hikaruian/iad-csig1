@@ -1,0 +1,109 @@
+# paplus_redemption.yaml -- Hail-Mary safe config after paplus_champion crash.
+#
+# Root cause of the 52-point crash: CLIP map calibration collected statistics
+# from RAW WinCLIP maps (spiky, sparse) while inference ran SMOOTHED maps
+# (kernel=7, sigma=3) before percentile normalisation, so c_lo/c_hi were
+# way too high and ~80% of pixels clipped to 0, which then nuked the DINO
+# map through geometric fusion (d * 0 ≈ 0). That bug is FIXED in pipeline.py
+# (calibration now applies the same bilinear+smooth as inference when
+# clip_mask_ens is on).
+#
+# But to be SAFE this run, we turn clip_mask_ens OFF entirely (so CLIP only
+# contributes to the IMAGE score where it is proven to help -- I-AUROC went
+# from 0.878 -> 0.899 in champion even as pixels died).
+#
+# Improvements over paplus_best (65.53 baseline):
+#   1. h-only TTA ("orig","h") -- v/hv flips were creating OOD views for
+#      fixed-rig parts, causing FP hotspots at edges.
+#   2. random coreset at 10% coverage (coreset_ratio=0.10, coreset_max=49152)
+#      -- 4% bank was too sparse; random coreset is unbiased vs FPS's
+#      outlier-preferring selection. Bank size ~10k/class (vs 4k before)
+#      gives better normal-coverage and directly reduces texture/edge FP.
+#   3. CLIP image weight 0.20 (same as champion -- that part worked).
+#   4. lo_q=0.65, gamma=2.5 (slightly more aggressive bg crush, matching
+#      champion; on paplus_best these were 0.60/2.2 and slightly noisier).
+#   5. CC slightly tighter: min_area 30, threshold 0.40, kill 0.05.
+#
+# All other parameters match paplus_best (proven 65.53 safe point).
+#
+# Expected:
+#   If bug-fix alone was enough -> ~65.5 (back to paplus_best)
+#   If coreset+TTA help -> 67-70
+#   If anything else broke -> I will stop touching knobs.
+
+train_root: "CSIG/Train"
+test_root:  "CSIG/Test_A"
+out_dir:    "submission_redemption"
+
+dinov2_model: "vitl14"
+dinov2_layers: [8, 9, 10, 11]
+input_size: 448
+multi_scale: []
+multi_scale_weights: []
+
+use_clip: true
+clip_model: "ViT-L-14-336"
+clip_pretrained: "openai"
+# MASK FUSION IS OFF. Only image-level CLIP blend (proven to raise I-AUROC).
+clip_mask_ens: false
+
+# Denser random coreset -- this is the main structural change vs paplus_best
+coreset_ratio: 0.10
+coreset_max: 49152
+coreset_method: "random"
+neighbourhood_size: 1
+n_neighbours: 1
+smooth_kernel: 5
+smooth_sigma: 1.8
+cls_bank_weight: 0.15
+coreset_batch: 64
+coreset_presample_ratio: 3.0
+random_proj_dim: 256
+
+hard_negative_k: 0
+
+use_foreground_mask: false
+fg_percentile: 35.0
+fg_bg_floor: 0.20
+fg_smooth_sigma: 2.5
+fg_hard_threshold: 0.0
+
+use_whitening: false
+whitening_eps: 0.01
+
+cc_min_area: 30
+cc_threshold: 0.40
+cc_kill_factor: 0.05
+
+mv_aggregate: "robust_mean"
+mv_vote_beta: 1.5
+use_mv_attn: false
+mv_mask_vote: "none"
+
+# TTA: h-flip only (no v/hv -- they are OOD for fixed-rig parts)
+use_tta: true
+tta_weight_orig: 1.0
+tta_weight_flip: 0.5
+tta_flips: ["orig", "h"]
+
+ens_dino_weight: 1.0
+ens_clip_weight: 0.20
+ens_clip_mask_weight: 0.0
+
+dino_map_lo_q: 0.65
+dino_map_hi_q: 0.997
+dino_img_lo_q: 0.05
+dino_img_hi_q: 0.95
+
+mask_gamma: 2.5
+
+batch_size: 2
+clip_batch_size: 1
+dino_view_micro: 2
+knn_chunk: 512
+num_workers: 4
+use_amp: true
+banks_on_gpu: false
+coreset_on_gpu: true
+device: "cuda"
+seed: 42

@@ -41,9 +41,19 @@ def load_yaml_cfg(path: str | Path) -> dict:
 
 
 def merge_into_cfg(cfg: PipelineConfig, overrides: dict) -> PipelineConfig:
+    from typing import get_type_hints, get_origin, get_args
+    hints = get_type_hints(PipelineConfig)
     for k, v in overrides.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
+        if not hasattr(cfg, k):
+            continue
+        # Auto-coerce list -> tuple when the dataclass field expects a tuple
+        # (YAML parses [...] as list; dataclass annotation is Tuple[...]).
+        anno = hints.get(k, None)
+        if isinstance(v, list) and anno is not None:
+            origin = get_origin(anno)
+            if origin is tuple:
+                v = tuple(v)
+        setattr(cfg, k, v)
     return cfg
 
 

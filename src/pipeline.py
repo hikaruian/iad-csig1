@@ -146,6 +146,17 @@ class PipelineConfig:
     use_tta: bool = True
     tta_weight_orig: float = 1.0
     tta_weight_flip: float = 0.5
+    # Which flip augmentations to apply. HORIZONTAL only ("orig","h") is
+    # the safe default for industrial parts on a fixed rig. v/hv flips
+    # are OOD for top/bottom-asymmetric parts and cause FP hotspots.
+    tta_flips: Tuple[str, ...] = ("orig", "h")
+    # Coreset selection: "fps" (default, farthest-point) or "random"
+    # (simple uniform subsample). In AD competitions random coreset
+    # often gives BETTER P-AP than FPS because FPS preferentially picks
+    # boundary/outlier points (which become "representative" anchors in
+    # the bank) while random sampling is unbiased and better covers
+    # the dense normal modes.
+    coreset_method: str = "fps"
 
     # ---- ensemble ----
     ens_dino_weight: float = 0.75
@@ -165,6 +176,9 @@ class PipelineConfig:
     dino_map_hi_q: float = 0.997   # leave the top 0.3% tail to saturate at 1
     dino_img_lo_q: float = 0.05
     dino_img_hi_q: float = 0.95
+    # Same scheme for CLIP maps (used only when clip_mask_ens is on).
+    clip_map_lo_q: float = 0.65
+    clip_map_hi_q: float = 0.997
 
     # ---- foreground mask (DINOv2 CLS<->patch final-norm cosine saliency) ----
     # NOTE: applied AFTER percentile normalisation on the FINAL ensembled mask
@@ -266,6 +280,7 @@ class CSIGAnomalyPipeline:
             coreset_presample_ratio=self.cfg.coreset_presample_ratio,
             use_whitening=bool(getattr(self.cfg, "use_whitening", False)),
             whitening_eps=float(getattr(self.cfg, "whitening_eps", 0.01)),
+            coreset_method=str(getattr(self.cfg, "coreset_method", "fps")),
         )
         # Calibrator for image-level scores (per-class)
         self.calibrator = PerClassPercentileCalibrator()
@@ -483,7 +498,11 @@ class CSIGAnomalyPipeline:
             else:
                 views_s = F.interpolate(views, size=(scale, scale),
                                          mode="bilinear", align_corners=False)
-            augs = tta_flips(views_s) if self.cfg.use_tta else [("orig", views_s)]
+            tta_mode = getattr(self.cfg, "tta_flips", ("orig", "h"))
+            if self.cfg.use_tta:
+                augs = list(tta_flips(views_s, which=tta_mode))
+            else:
+                augs = [("orig", views_s)]
             scale_map = torch.zeros(V, H, W, device=views.device, dtype=torch.float32)
             scale_pv = torch.zeros(V, device=views.device, dtype=torch.float32)
             scale_w = 0.0
@@ -704,12 +723,20 @@ class CSIGAnomalyPipeline:
                     del all_p_c, all_c_c
                     wc_c = winclip_score(self.clip, c_p, c_c, cls,
                                         reference_patches=ref, alpha=0.5)
-                    cm_c = wc_c["anomaly_map"].detach()  # (V, Hp_c, Wp_c)
-                    # Bilinear upsample to 448 for consistent pixel sampling
-                    if cm_c.shape[-1] != self.cfg.input_size or cm_c.shape[-2] != self.cfg.input_size:
-                        cm_c = F.interpolate(cm_c.unsqueeze(1),
-                                             size=(self.cfg.input_size, self.cfg.input_size),
-                                             mode="bilinear", align_corners=False).squeeze(1)
+                    cm_c = wc_c["anomaly_map"].detach().unsqueeze(1)  # (V,1,Hp,Wp)
+                    # MUST apply EXACTLY the same post-processing as inference
+                    # (bilinear upsample + gaussian smooth) otherwise the
+                    # percentile statistics we collect here are on the RAW
+                    # spiky map while inference normalises a SMOOTHED map --
+                    # leading to c_lo/c_hi being far too high and ~80% of
+                    # inference pixels getting clamped to 0 (which nuked
+                    # P-AUROC/P-AP in the geometric-mask fusion).
+                    cm_c = bilinear_upsample(cm_c, self.cfg.input_size)
+                    # Only apply smooth if we will apply it at inference too
+                    # (i.e. when clip_mask_ens is enabled).
+                    if getattr(self.cfg, "clip_mask_ens", False):
+                        cm_c = gaussian_smooth2d(cm_c, kernel_size=7, sigma=3.0)
+                    cm_c = cm_c[:, 0]  # (V, H, W)
                     flat_c = cm_c.reshape(-1).cpu()
                     idx_c = torch.randperm(flat_c.shape[0], generator=g_cal)[:2000]
                     clip_map_pix_buf[cls].append(flat_c[idx_c])
@@ -1019,4 +1046,3 @@ class CSIGAnomalyPipeline:
         out_np = cmap.clamp(0, 1).cpu().numpy()
         del c_patch, c_cls, wc, cm, cmap, img_score
         return cal_score, out_np
-
