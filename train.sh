@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES=0 python train.py \
-    --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
+    --train-root /kaggle/input/datasets/dickdickgo/real-iad/Train \
     --save-dir runs/smoke_test \
     --image-size 448 \
     --batch-size 1 \
@@ -15,7 +15,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
+  --train-root /kaggle/input/datasets/dickdickgo/real-iad/Train \
   --save-dir runs/inpformer_v3_t4x2 \
   --encoder dinov2reg_vit_base_14 \
   --encoder-source auto \
@@ -46,7 +46,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
+  --train-root /kaggle/input/datasets/dickdickgo/real-iad/Train \
   --save-dir runs/inpformer_v3_t4x2 \
   --encoder dinov2reg_vit_base_14 \
   --image-size 448 \
@@ -72,7 +72,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
+  --train-root /kaggle/input/datasets/dickdickgo/real-iad/Train \
   --save-dir runs/ddp_smoke \
   --encoder dinov2reg_vit_base_14 \
   --image-size 448 \
