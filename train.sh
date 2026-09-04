@@ -15,7 +15,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /path/to/CSIG/Train \
+  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
   --save-dir runs/inpformer_v3_t4x2 \
   --encoder dinov2reg_vit_base_14 \
   --encoder-source auto \
@@ -46,7 +46,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /path/to/CSIG/Train \
+  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
   --save-dir runs/inpformer_v3_t4x2 \
   --encoder dinov2reg_vit_base_14 \
   --image-size 448 \
@@ -72,7 +72,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   train.py \
-  --train-root /path/to/CSIG/Train \
+  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
   --save-dir runs/ddp_smoke \
   --encoder dinov2reg_vit_base_14 \
   --image-size 448 \

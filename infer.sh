@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES=0 \
 python infer.py \
-  --test-root /data/CSIG/Test_A \
-  --train-root /data/CSIG/Train \
+  --test-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Test_A \
+  --train-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
   --ckpt runs/inpformer_v3/best.pth \
   --out-dir outputs/v3_raw \
   --zip outputs/v3_raw.zip \
@@ -16,7 +16,7 @@ python infer.py \
 #TTA
 CUDA_VISIBLE_DEVICES=0 \
 python infer.py \
-  --test-root /data/CSIG/Test_A \
+  --test-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Test_A \
   --ckpt runs/inpformer_v3/best.pth \
   --out-dir outputs/v3_tta \
   --zip outputs/v3_tta.zip \
@@ -35,7 +35,7 @@ torchrun \
   --standalone \
   --nproc_per_node=2 \
   infer.py \
-  --test-root /data/CSIG/Test_A \
+  --test-root /home/kali/Downloads/project/iad-csig/data/Real-IAD/Train \
   --ckpt runs/inpformer_v3/best.pth \
   --out-dir outputs/v3_tta \
   --zip outputs/v3_tta.zip \
